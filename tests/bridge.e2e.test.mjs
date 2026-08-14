@@ -310,6 +310,54 @@ test('P3 hybrid: write delegates to the client when it advertises fs.writeTextFi
   }
 })
 
+test('P3 hybrid: a client write refusal surfaces as a tool failure, not a crash', { skip: !PROMPT_AVAILABLE }, async () => {
+  const hybrid = spawnBridge({
+    env: { DSHACP_HYBRID: '1' },
+    handlers: {
+      writeTextFile: async () => {
+        throw new Error('client refused the write')
+      },
+    },
+  })
+  try {
+    await waitFor(async () => {
+      try {
+        await hybrid.client.initialize({
+          protocolVersion: 1,
+          clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+          clientInfo: { name: 'dshacp-hybrid-fail-test', version: '0.0.1' },
+        })
+        return true
+      } catch {
+        return false
+      }
+    }, 60000)
+    const created = await hybrid.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+    const result = await hybrid.client.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'Use the write tool to create .hybrid-fail-test.txt with content: xyz. Report what happened.' }],
+    })
+    assert.ok(['end_turn', 'max_tokens'].includes(result.stopReason), `prompt settled: ${result.stopReason}`)
+    const request = await waitFor(() => hybrid.updates.find(update => update.kind === 'write_text_file'))
+    const toolId = await waitFor(() => {
+      const call = hybrid.updates.find(update =>
+        update.kind === 'session_update' && update.tag === 'tool_call'
+        && update.update.title === 'write')
+      return call?.update.toolCallId
+    })
+    const settled = await waitFor(() => hybrid.updates.find(update =>
+      update.kind === 'session_update' && update.tag === 'tool_call_update'
+      && update.update.toolCallId === toolId))
+    assert.match(String(settled.update.rawOutput), /client write failed|refused/i,
+      'the refusal is visible in the tool outcome')
+    assert.ok(request.params.path.endsWith('.hybrid-fail-test.txt'))
+    await hybrid.client.closeSession({ sessionId: created.sessionId })
+  } finally {
+    await hybrid.stop()
+    await rm(join(PROJECT_ROOT, '.hybrid-fail-test.txt'), { force: true })
+  }
+})
+
 test('approval bridge: a bash escalation surfaces as request_permission and allow-once grants it', { skip: !PROMPT_AVAILABLE }, async () => {
   const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
   // Home-directory write → sandbox denial → model escalates with

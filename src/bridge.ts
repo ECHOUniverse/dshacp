@@ -389,12 +389,15 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     if (closed) return Promise.resolve('rejected')
     if (record.allowedTools.has(request.toolName)) return Promise.resolve('allowed-once')
     return new Promise<ApprovalOutcome>((resolve) => {
-      const timer = setTimeout(() => resolve('rejected'), approvalTimeoutMs)
-      timer.unref?.()
       const settle = (outcome: ApprovalOutcome): void => {
+        // Every path — client answer, timeout, or cancel — clears the pending
+        // slot so a later cancel cannot settle a stale permission.
+        if (record.permission?.settle === settle) record.permission = undefined
         clearTimeout(timer)
         resolve(outcome)
       }
+      const timer = setTimeout(() => settle('rejected'), approvalTimeoutMs)
+      timer.unref?.()
       record.permission = { settle, timer }
       const toolCall: ToolCallUpdate = {
         toolCallId: String(callId),
@@ -455,14 +458,29 @@ export function apply(ctx: Context, config: BridgeConfig): void {
             required: true,
             description: 'Full UTF-8 text content to write.',
           },
+          // Schema parity with the global write tool: the sandbox escalation
+          // fields are accepted and ignored — hybrid writes go through the
+          // client editor, which is not sandboxed by this process.
+          sandbox_permissions: {
+            type: 'string',
+            description: 'Accepted for schema parity; ignored in hybrid mode.',
+          },
+          justification: {
+            type: 'string',
+            description: 'Accepted for schema parity; ignored in hybrid mode.',
+          },
         },
         output: {
+          // Mirrors the global write tool's result shape (path/operation/
+          // before/after) so the model sees a consistent vocabulary.
           schema: {
             type: 'object',
             additionalProperties: false,
             properties: {
               path: { type: 'string', required: true },
               operation: { type: 'string', required: true },
+              before: { required: true, oneOf: [{ type: 'string' }, { type: 'null' }] },
+              after: { type: 'string', required: true },
             },
           },
           render: (_args, value) => [{
@@ -472,8 +490,15 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         },
         async execute(args) {
           const target = isAbsolute(args.file_path) ? args.file_path : join(cwd, args.file_path)
-          await conn!.writeTextFile({ sessionId, path: target, content: args.content })
-          return { path: target, operation: 'client-write' }
+          try {
+            await conn!.writeTextFile({ sessionId, path: target, content: args.content })
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error)
+            throw new Error(`client write failed (hybrid mode): ${detail}`)
+          }
+          // The client owns the edit; report the full intended content as the
+          // after-state (before is unknown to this process).
+          return { path: target, operation: 'client-write', before: null, after: args.content }
         },
       }))
     }
@@ -482,9 +507,10 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   /**
    * Resolve the bridge session a delegated run (workflow/subagent) belongs to
    * (P2-1). These events carry no agent identity, but a run only executes
-   * while the initiating agent's tool call is in flight — exactly one prompt
-   * is pending for that session, so the pending-turn record is the owner.
-   * Falls back to the initiator boundary when the event chain still carries it.
+   * while the initiating agent's tool call is in flight. The initiator
+   * boundary is the precise correlation when the event chain still carries
+   * it; otherwise the pending-turn record is the owner — and only when it is
+   * UNIQUE, so concurrent sessions can never misattribute a plan update.
    */
   const turnOwner = (): SessionRecord | undefined => {
     const initiator = agents.currentInitiator()
@@ -492,7 +518,8 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       const record = ownedRecord(initiator)
       if (record !== undefined) return record
     }
-    return [...sessions.values()].find(record => record.inflight !== undefined)
+    const pending = [...sessions.values()].filter(record => record.inflight !== undefined)
+    return pending.length === 1 ? pending[0] : undefined
   }
 
   /** Send the workflow state as a whole-plan replacement (DESIGN P2-1). */
@@ -519,9 +546,34 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     })
   }
 
+  /**
+   * Resolve the live workflow state for one run event: the owning record must
+   * exist and hold the matching run (a stale event from an older run is
+   * ignored). Shared by every workflow handler.
+   */
+  const workflowOf = (info: { id: unknown }, record: SessionRecord | undefined): SessionRecord | undefined => {
+    if (record === undefined || record.workflow === undefined || record.workflow.runId !== String(info.id)) return undefined
+    return record
+  }
+
+  /** One brief subagent plan entry (P2-1); the stop reason annotates failures. */
+  const emitSubagentPlan = (record: SessionRecord, provider: string, id: string, status: PlanEntryStatus, stopReason?: string): void => {
+    const label = stopReason !== undefined && stopReason !== 'completed'
+      ? `subagent: ${provider} (${id}) (${stopReason})`
+      : `subagent: ${provider} (${id})`
+    notify({
+      sessionId: sessionOf(record).id,
+      update: {
+        sessionUpdate: 'plan',
+        entries: [{ content: label, priority: 'medium', status }],
+      },
+    })
+  }
+
   // Workflow runs render as plan updates: phases become progress groups and
-  // each `agent()` call becomes a task entry that flips to completed/failed
-  // when it settles (P2-1). The last update reports the run's stop reason.
+  // each `agent()` call becomes a task entry that settles (completed, with the
+  // outcome annotated) when it ends (P2-1). The last update reports the run's
+  // stop reason.
   ctx.on('workflow/start', (info) => {
     const record = turnOwner()
     if (record === undefined) return
@@ -535,31 +587,37 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   })
 
   ctx.on('workflow/phase', (info, title) => {
-    const record = turnOwner()
-    if (record === undefined || record.workflow === undefined || record.workflow.runId !== String(info.id)) return
+    const record = workflowOf(info, turnOwner())
+    if (record === undefined || record.workflow === undefined) return
     record.workflow.phase = title
     emitWorkflowPlan(record)
   })
 
   ctx.on('workflow/agent-start', (info, agent) => {
-    const record = turnOwner()
-    if (record === undefined || record.workflow === undefined || record.workflow.runId !== String(info.id)) return
+    const record = workflowOf(info, turnOwner())
+    if (record === undefined || record.workflow === undefined) return
     record.workflow.agents.set(agent.seq, { label: agent.label, phase: agent.phase, status: 'in_progress' })
     emitWorkflowPlan(record)
   })
 
   ctx.on('workflow/agent-end', (info, agent) => {
-    const record = turnOwner()
-    if (record === undefined || record.workflow === undefined || record.workflow.runId !== String(info.id)) return
+    const record = workflowOf(info, turnOwner())
+    if (record === undefined || record.workflow === undefined) return
     const entry = record.workflow.agents.get(agent.seq)
-    if (entry !== undefined) entry.status = agent.outcome === 'completed' ? 'completed' : 'in_progress'
+    if (entry !== undefined) {
+      // The call is over whatever its outcome: settle the entry and annotate
+      // a non-clean outcome so the client never sees a spinning task.
+      entry.status = 'completed'
+      if (agent.outcome !== 'completed') entry.label = `${entry.label} (${agent.outcome})`
+    }
     emitWorkflowPlan(record)
   })
 
   ctx.on('workflow/end', (info, result) => {
-    const record = turnOwner()
-    if (record === undefined || record.workflow === undefined || record.workflow.runId !== String(info.id)) return
-    const summary = result.stopReason === 'completed' ? 'completed' : 'in_progress'
+    const record = workflowOf(info, turnOwner())
+    if (record === undefined || record.workflow === undefined) return
+    // Any stop reason ends the run: settle the entry and let the content carry
+    // the outcome so the client never sees a spinning task.
     notify({
       sessionId: sessionOf(record).id,
       update: {
@@ -567,7 +625,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         entries: [{
           content: `workflow: ${record.workflow.name} (${result.stopReason})`,
           priority: 'medium',
-          status: summary,
+          status: 'completed',
         }],
       },
     })
@@ -580,33 +638,15 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   ctx.on('subagent/start', (info) => {
     const record = turnOwner()
     if (record === undefined) return
-    notify({
-      sessionId: sessionOf(record).id,
-      update: {
-        sessionUpdate: 'plan',
-        entries: [{
-          content: `subagent: ${info.provider} (${info.id})`,
-          priority: 'medium',
-          status: 'in_progress',
-        }],
-      },
-    })
+    emitSubagentPlan(record, info.provider, String(info.id), 'in_progress')
   })
 
   ctx.on('subagent/end', (info) => {
     const record = turnOwner()
     if (record === undefined) return
-    notify({
-      sessionId: sessionOf(record).id,
-      update: {
-        sessionUpdate: 'plan',
-        entries: [{
-          content: `subagent: ${info.provider} (${info.id})`,
-          priority: 'medium',
-          status: 'completed',
-        }],
-      },
-    })
+    // Any stop reason ends the run: settle the entry; a non-clean reason is
+    // annotated in the label so the client never sees a spinning task.
+    emitSubagentPlan(record, info.provider, String(info.id), 'completed', info.stopReason)
   })
 
   /** Build per-agent options from bridge config without assigning absent optional fields. */

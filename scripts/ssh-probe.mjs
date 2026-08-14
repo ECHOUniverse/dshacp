@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { Readable, Writable } from 'node:stream'
 import { ClientSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'
-const child = spawn('node', ['lib/bin.js'], { cwd: '/Volumes/WD-1T/00_Workspace/00_Active/CodeProject/DSHACP', stdio: ['pipe','pipe','inherit'], env: { ...process.env, DSH_SESSIONS_ROOT: '/tmp/ssh-probe-sessions' } })
+const child = spawn('node', ['lib/bin.js'], { cwd: new URL('..', import.meta.url).pathname, stdio: ['pipe','pipe','inherit'], env: { ...process.env, DSH_SESSIONS_ROOT: '/tmp/ssh-probe-sessions' } })
 const stream = ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout))
 const client = new ClientSideConnection(() => ({
   requestPermission: async () => ({ outcome: 'cancelled' }),
