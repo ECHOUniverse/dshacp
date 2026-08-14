@@ -59,6 +59,7 @@ import {
   toolResultToText,
   turnEndToStopReason,
 } from './codec.ts'
+import { pickDefined } from './options.ts'
 
 export const name = 'dshacp-bridge'
 /** The bridge creates and owns agents; the title service and store serve the wire. */
@@ -197,7 +198,8 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     record.usage.cacheRead += usage.cacheReadTokens ?? 0
     record.usage.cacheWrite += usage.cacheWriteTokens ?? 0
     record.usage.reasoning += usage.reasoningTokens ?? 0
-    const used = record.usage.input + record.usage.output + record.usage.cacheRead + record.usage.cacheWrite
+    // "Tokens currently in context": input + output + cache + thought tokens.
+    const used = record.usage.input + record.usage.output + record.usage.cacheRead + record.usage.cacheWrite + record.usage.reasoning
     if (used <= 0) return
     const size = record.agent.session.requestContext()?.contextWindow ?? 0
     notify({
@@ -339,6 +341,11 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   ctx.on('agent/error', ({ agent, turn, error }) => {
     const record = ownedRecord(agent)
     const inflight = record?.inflight
+    // A correlated turn error is already rejected by the `turn/end` error
+    // branch in the session/event handler (durable turn/end always follows);
+    // this listener catches errors outside that correlation — a prompt whose
+    // inbox claim never arrived, or an agent that errored before its turn —
+    // so the prompt fails rather than settling as `cancelled` at quiescence.
     if (record === undefined || inflight === undefined || inflight.turn === turn) return
     record.inflight = undefined
     inflight.reject(internalError(`turn failed: ${errorChain(error)}`))
@@ -371,12 +378,12 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         sessionId: record.agent.session.id,
         toolCall,
         options: [
-          { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
-          { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
+          { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+          { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' },
         ],
       }).then(({ outcome }) => {
         if (outcome.outcome === 'cancelled') settle('cancelled')
-        else if (outcome.optionId === 'allow-once') settle('allowed-once')
+        else if (outcome.optionId === 'allow_once') settle('allowed-once')
         else settle('rejected')
       }).catch(() => settle('rejected'))
     })
@@ -392,10 +399,8 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   }
 
   /** Build per-agent options from bridge config without assigning absent optional fields. */
-  const agentOptions = (): { provider?: string; model?: string } => ({
-    ...config.provider !== undefined ? { provider: config.provider } : {},
-    ...config.model !== undefined ? { model: config.model } : {},
-  })
+  const agentOptions = (): { provider?: string; model?: string } =>
+    pickDefined(config, ['provider', 'model'])
 
   /** Resume a persisted session into the bridge, rejecting when already open. */
   const resumeRecord = async (sessionId: SessionId, cwd: string): Promise<SessionRecord> => {

@@ -12,7 +12,7 @@ const stream = ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.st
 const client = new ClientSideConnection(() => ({
   requestPermission: async (params) => {
     console.log('>>> REQUEST_PERMISSION', JSON.stringify(params).slice(0, 400))
-    return { outcome: 'selected', optionId: 'reject-once' }
+    return { outcome: 'selected', optionId: 'reject_once' }
   },
   readTextFile: async () => ({ content: '' }),
   writeTextFile: async () => null,

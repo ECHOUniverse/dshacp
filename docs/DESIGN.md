@@ -203,6 +203,11 @@ DSH's `approval/request` is a **synchronous waterfall**; ACP's `session/request_
   from the list after close.
 - **Approval rejection** surfaces as a completed tool call whose `rawOutput` reports the
   refusal (the DSH tool presents rejection as a result, not a throw).
+- **Permission `optionId`s** follow §7 literally: `allow_once` / `reject_once` (the
+  `kind` field carries the same value; the official `dsh-acp` used hyphens, but the
+  DESIGN table is the contract here).
+- **`usage_update.used`** counts input + output + cache + thought tokens ("tokens in
+  context"), accumulated session-wide.
 - **Message ids**: `msg-<turn>-<step>` for assistant streams, `thought-<turn>-<step>` for
   reasoning, `usr-<seq>` for replayed user prompts.
 

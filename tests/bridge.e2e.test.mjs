@@ -216,7 +216,7 @@ test('approval bridge: a bash escalation surfaces as request_permission and allo
   const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
   // Home-directory write → sandbox denial → model escalates with
   // sandbox_permissions → approval/request → bridge pushes request_permission.
-  bridge.answerPermission({ outcome: 'selected', optionId: 'allow-once' })
+  bridge.answerPermission({ outcome: 'selected', optionId: 'allow_once' })
   const result = await bridge.client.prompt({
     sessionId: created.sessionId,
     prompt: [{ type: 'text', text: 'Run: touch ~/dshacp-approval-probe. If you hit a sandbox denial, retry the exact same command once with sandbox_permissions and a one-sentence justification, then confirm the file was created.' }],
@@ -245,7 +245,7 @@ test('approval bridge: a bash escalation surfaces as request_permission and allo
 
 test('approval bridge: reject-once fails the tool closed', { skip: !PROMPT_AVAILABLE }, async () => {
   const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
-  bridge.answerPermission({ outcome: 'selected', optionId: 'reject-once' })
+  bridge.answerPermission({ outcome: 'selected', optionId: 'reject_once' })
   const result = await bridge.client.prompt({
     sessionId: created.sessionId,
     prompt: [{ type: 'text', text: 'Run: touch ~/dshacp-approval-probe. If you hit a sandbox denial, retry the exact same command once with sandbox_permissions and a one-sentence justification, then report what happened.' }],

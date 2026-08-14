@@ -48,6 +48,7 @@ import JsonlSessionPersistence, {
 import * as sessionCheckpointPolicy from '@deepseek-ai/dsh-session-checkpoint-policy'
 import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite'
 import * as bridge from './bridge.ts'
+import { pickDefined } from './options.ts'
 
 export const name = 'dshacp'
 const DEFAULT_PERSISTENCE_ROOT = './.sessions'
@@ -166,22 +167,25 @@ export const Config: z<Config> = z.object({
 
 /**
  * Copy the spine-owned fields from an app config without leaking entry-point
- * settings. Absent optional fields stay absent so owner schemas apply defaults.
+ * settings. Absent optional fields stay absent so owner schemas apply defaults;
+ * `workspaceContext` is required and always forwarded.
  */
 function pickSpineConfig(config: Config): Omit<Config, 'provider' | 'model' | 'persistenceRoot' | 'packChunks' | 'persistenceCompression' | 'approvalTimeoutMs'> {
   return {
-    ...config.maxParallelToolCalls !== undefined ? { maxParallelToolCalls: config.maxParallelToolCalls } : {},
-    ...config.persona !== undefined ? { persona: config.persona } : {},
-    ...config.toolOrder !== undefined ? { toolOrder: config.toolOrder } : {},
-    ...config.tools !== undefined ? { tools: config.tools } : {},
-    ...config.dshHome !== undefined ? { dshHome: config.dshHome } : {},
-    ...config.sessionTitle !== undefined ? { sessionTitle: config.sessionTitle } : {},
+    ...pickDefined(config, [
+      'maxParallelToolCalls',
+      'persona',
+      'toolOrder',
+      'tools',
+      'dshHome',
+      'sessionTitle',
+      'skills',
+      'toolBash',
+      'jobs',
+      'toolJobs',
+      'invariants',
+    ]),
     workspaceContext: config.workspaceContext,
-    ...config.skills !== undefined ? { skills: config.skills } : {},
-    ...config.toolBash !== undefined ? { toolBash: config.toolBash } : {},
-    ...config.jobs !== undefined ? { jobs: config.jobs } : {},
-    ...config.toolJobs !== undefined ? { toolJobs: config.toolJobs } : {},
-    ...config.invariants !== undefined ? { invariants: config.invariants } : {},
   }
 }
 
