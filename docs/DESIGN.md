@@ -214,12 +214,16 @@ DSH's `approval/request` is a **synchronous waterfall**; ACP's `session/request_
 ### Phase 2 (P2) ✅ (implemented; e2e-tested against a real model)
 - [x] **Structured exposure of `subagent` / `workflow` as updates**: workflow runs render as
   `plan` updates — `workflow/start` announces the run, `workflow/phase` becomes a progress
-  group, each `agent()` call becomes a task entry that flips to completed when it settles,
-  and `workflow/end` reports the stop reason. Subagent runs render as brief start/completed
-  plan entries. Run→session correlation uses the pending-turn owner (a run only executes
-  while its initiating agent's prompt is in flight), with the initiator boundary as a
-  fallback. `goal` is **not** exposed: the composition mounts no goal domain (P1 spine
-  skips it), so there is no goal state to map — revisit if goals are enabled.
+  group, each `agent()` call becomes a task entry that flips to completed when it settles
+  (non-clean outcomes annotated in the label), and `workflow/end` reports the stop reason.
+  Subagent runs render as brief start/completed plan entries (non-`completed` stop reasons
+  annotated). Run→session correlation prefers the initiator boundary when the event chain
+  still carries it (exact attribution); otherwise it uses the pending-turn owner — and only
+  when **exactly one** session has a turn in flight, so concurrent sessions can never
+  misattribute a plan update. Note: the public `subagent/start`/`subagent/end` events carry
+  only `(info)` — no parent agent — so correlation cannot use a parent reference.
+  `goal` is **not** exposed: the composition mounts no goal domain (P1 spine skips it), so
+  there is no goal state to map — revisit if goals are enabled.
 - [x] **First-class ACP surface for the `ssh` plugin**: `@linxin666/dsh-ssh` is mounted in
   `cordis.yml`; the app provides a no-op `webServer` stub (this process serves no HTTP, so
   the plugin's route/upgrade registrations are discarded) while the SSH engine, model tools
