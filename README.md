@@ -1,5 +1,7 @@
 # DSHACP — Zed-first ACP v1 server for DeepSeek Harness
 
+English | [中文](README.zh.md)
+
 Zed (agent panel, ACP v1 stdio client) → **dshacp** (independent agent spine) → DSH core services.
 
 `dshacp` is a standalone DSH application binary that speaks the **Agent Client
