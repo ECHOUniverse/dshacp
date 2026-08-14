@@ -73,6 +73,13 @@ export const inject = ['agents', 'sessionTitle', 'sessions']
 export const DEFAULT_APPROVAL_TIMEOUT_MS = 10 * 60 * 1000
 
 /**
+ * Fixed plan-entry priority for every mapped update (DESIGN §17): DSH todos
+ * carry no priority, so the mapping pins `medium` for todo, workflow, and
+ * subagent plans alike.
+ */
+export const PLAN_PRIORITY = 'medium' as const
+
+/**
  * The single continuable-subagent teardown the bridge needs. Declared
  * structurally so this package does not depend on the subagent seam for one
  * shutdown hook; an absent service means nothing continuable was materialized.
@@ -490,8 +497,13 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         },
         async execute(args) {
           const target = isAbsolute(args.file_path) ? args.file_path : join(cwd, args.file_path)
+          // The connection is assigned before any session handler can run
+          // (makeAgent completes inside initialize); guard anyway so a
+          // misordered client call fails loudly instead of throwing a null
+          // dereference.
+          if (conn === undefined) throw new Error('client write failed (hybrid mode): connection not ready')
           try {
-            await conn!.writeTextFile({ sessionId, path: target, content: args.content })
+            await conn.writeTextFile({ sessionId, path: target, content: args.content })
           } catch (error) {
             const detail = error instanceof Error ? error.message : String(error)
             throw new Error(`client write failed (hybrid mode): ${detail}`)
@@ -526,19 +538,19 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   const emitWorkflowPlan = (record: SessionRecord): void => {
     const workflow = record.workflow
     if (workflow === undefined) return
-    const entries: { content: string; priority: 'medium'; status: PlanEntryStatus }[] = []
+    const entries: { content: string; priority: typeof PLAN_PRIORITY; status: PlanEntryStatus }[] = []
     for (const agent of workflow.agents.values()) {
       entries.push({
         content: agent.phase !== undefined ? `${agent.label} (${agent.phase})` : agent.label,
-        priority: 'medium',
+        priority: PLAN_PRIORITY,
         status: agent.status,
       })
     }
     if (workflow.phase !== undefined) {
-      entries.push({ content: `phase: ${workflow.phase}`, priority: 'medium', status: 'in_progress' })
+      entries.push({ content: `phase: ${workflow.phase}`, priority: PLAN_PRIORITY, status: 'in_progress' })
     }
     if (entries.length === 0) {
-      entries.push({ content: `workflow: ${workflow.name}`, priority: 'medium', status: 'in_progress' })
+      entries.push({ content: `workflow: ${workflow.name}`, priority: PLAN_PRIORITY, status: 'in_progress' })
     }
     notify({
       sessionId: sessionOf(record).id,
@@ -565,7 +577,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       sessionId: sessionOf(record).id,
       update: {
         sessionUpdate: 'plan',
-        entries: [{ content: label, priority: 'medium', status }],
+        entries: [{ content: label, priority: PLAN_PRIORITY, status }],
       },
     })
   }
@@ -624,7 +636,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         sessionUpdate: 'plan',
         entries: [{
           content: `workflow: ${record.workflow.name} (${result.stopReason})`,
-          priority: 'medium',
+          priority: PLAN_PRIORITY,
           status: 'completed',
         }],
       },
