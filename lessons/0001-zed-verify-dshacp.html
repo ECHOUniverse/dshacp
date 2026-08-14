@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 1 课：在 Zed 中跑通 DSHACP（首次对话）</title>
+<link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+
+<h1>第 1 课：在 Zed 中跑通 DSHACP（首次对话）</h1>
+
+<p>这一课的目标只有一个：<strong>在 Zed 里跟 DSH 的 agent 说上话，看到文字流式出现。</strong>
+做完这一课，你就有了一个看得见的胜利，后面的功能验证都是在这个基础上加料。</p>
+
+<h2>背景：你在做什么</h2>
+<p>Zed 通过 <strong>ACP 协议</strong>（一个标准，相当于 AI 编辑器和 agent 之间的"电话线协议"）跟外部 agent 通信。
+你的 <code>dshacp</code> 就是这条电话线的"服务端"——Zed 负责拨号（启动进程、发消息），dshacp 负责接听（跑 DeepSeek 模型、执行工具、回传结果）。
+官方文档：<a href="https://zed.dev/docs/ai/external-agents">Zed 外部代理文档</a>。</p>
+
+<h2>前置检查（30 秒）</h2>
+<p>打开"终端"App（Spotlight 搜 Terminal），逐条输入：</p>
+<pre><code>node --version          # 应显示 v22 或更高
+ls ~/.dsh/.credentials.yaml   # 应显示文件存在（里面有 DEEPSEEK_API_KEY）
+ls /Applications/Zed.app      # 应显示 Zed 已安装</code></pre>
+<div class="note">你的机器这三条都已满足（我已帮你查过），可以直接进入下一步。</div>
+
+<h2>步骤 1：让 <code>dshacp</code> 命令全局可用（终端）</h2>
+<p>Zed 配置里写 <code>"command": "dshacp"</code>，意思是让系统去 PATH 里找这个命令。
+它还没被"安装"到 PATH 里，我们用 <code>npm link</code> 把它挂上去（在项目目录里执行）：</p>
+<pre><code>cd /Volumes/WD-1T/00_Workspace/00_Active/CodeProject/DSHACP
+npm run build      # 确保 lib/ 是最新的（你已经构建过，可跳过）
+npm link           # 把 dshacp 命令链接到全局</code></pre>
+<p>验证链接成功：</p>
+<pre><code>which dshacp       # 应输出一个路径，如 /usr/local/bin/dshacp
+dshacp --help      # 应显示用法说明（dshacp 是 stdio 服务，不是交互式 CLI，参数只有 --config 和 --help）</code></pre>
+<div class="ok">成功：<code>which dshacp</code> 输出路径，没有 "command not found"。</div>
+<div class="fail">失败：显示 <code>command not found</code> → 检查是否在项目目录执行了 <code>npm link</code>，或询问老师。</div>
+
+<h2>步骤 2：先不依赖 Zed，单独验证服务端活着（终端）</h2>
+<p>这个步骤很关键：<strong>先排除服务端问题</strong>。如果这里能通，后面 Zed 连不上就一定是配置问题。
+在终端运行下面这行（一条命令，直接粘贴回车）：</p>
+<pre><code>printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"manual-test","version":"0.0.1"}}}' | dshacp</code></pre>
+<p>这条命令的意思：手动给 dshacp 发一条 ACP 的 <code>initialize</code> 消息（协议握手），然后它应该回一条 JSON 回应。</p>
+<div class="ok">成功：屏幕上出现一行以 <code>{"jsonrpc":"2.0","id":1,"result":{...}}</code> 开头的 JSON，
+里面能看到 <code>"loadSession":true</code> 和 <code>"authMethods":[]</code>。看到这个就说明服务端完全正常。</div>
+<div class="fail">失败：报错或没有输出 → 服务端有问题，先解决它再继续（把报错贴给老师）。</div>
+<div class="tip">按 <kbd>Ctrl</kbd>+<kbd>C</kbd> 结束这条命令（它不会自己退出，是正常的——它在等你继续说话）。</div>
+
+<h2>步骤 3：在 Zed 设置里注册 DSH agent</h2>
+<p>Zed 的配置文件在 <code>~/.config/zed/settings.json</code>。我们用最直观的方式：让 Zed 自己打开设置。</p>
+<ol class="steps">
+  <li>
+    <span class="step-title">打开 Zed</span>（点 Dock 里的 Zed 图标）
+  </li>
+  <li>
+    <span class="step-title">打开设置</span>：按 <kbd>⌘</kbd>+<kbd>,</kbd>（逗号键），
+    或者按 <kbd>⌘</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> 打开命令面板，输入 <code>zed: open settings</code> 回车。
+    会打开一个 settings.json 编辑器标签页。
+  </li>
+  <li>
+    <span class="step-title">找到 <code>agent_servers</code> 块</span>：滚动找到 <code>"agent_servers": {</code>。
+    你里面已经有一个 <code>"pi-acp"</code> 条目。在它后面（注意逗号）加一个新条目：<br><br>
+    把下面这段插到 <code>"agent_servers": {</code> 的 <code>{</code> 之后、<code>"pi-acp"</code> 之前：
+<pre><code>    "DSH": {
+      "type": "custom",
+      "command": "dshacp",
+      "args": [],
+      "env": {}
+    },
+</code></pre>
+    完成后 <code>agent_servers</code> 部分看起来像这样：
+<pre><code>  "agent_servers": {
+    "DSH": {
+      "type": "custom",
+      "command": "dshacp",
+      "args": [],
+      "env": {}
+    },
+    "pi-acp": {
+      "default_config_options": { "thought_level": "xhigh" },
+      "type": "registry"
+    }
+  }</code></pre>
+  </li>
+  <li>
+    <span class="step-title">保存</span>：<kbd>⌘</kbd>+<kbd>S</kbd>。
+  </li>
+  <li>
+    <span class="step-title">重启 Zed</span>：<kbd>⌘</kbd>+<kbd>Q</kbd> 完全退出，再重新打开。
+    这一步很重要——agent 服务器列表在启动时读取，热保存不一定生效。
+  </li>
+</ol>
+<div class="note">三个字段的含义：<code>type: "custom"</code> 表示"我自己写的 agent"（必填，官方文档示例容易漏）；
+<code>command: "dshacp"</code> 是要启动的程序；<code>env: {}</code> 是额外环境变量——密钥不写这里，
+dshacp 自己会读 <code>~/.dsh/.credentials.yaml</code>。参考：<a href="https://zed.dev/docs/ai/external-agents#custom-agents">官方文档</a>。</div>
+
+<h2>步骤 4：新建 DSH 线程，开始对话 🎉</h2>
+<ol class="steps">
+  <li>
+    <span class="step-title">打开 Agent 面板</span>：按 <kbd>⌘</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>，
+    输入 <code>agent: new thread</code> 回车。或者点窗口右下角状态栏的 <strong>✨</strong> 图标。
+  </li>
+  <li>
+    <span class="step-title">选择 agent</span>：在新线程的 agent 选择菜单里，选择 <strong>DSH</strong>
+    （如果没看到，也可以命令面板输入 <code>agent: new external agent thread</code>，选择 DSH）。
+  </li>
+  <li>
+    <span class="step-title">发送第一条消息</span>：在下方的输入框输入：
+<pre><code>你好，请用一句话介绍你自己，然后说出当前工作目录里有什么。</code></pre>
+    按回车发送。
+  </li>
+</ol>
+
+<div class="ok">成功的样子：
+<ul>
+  <li>输入框上方出现 agent 的回复，<strong>文字一个字一个字地冒出来</strong>（流式输出）</li>
+  <li>可能先出现一段灰色/斜体的"思考"内容，然后才是正式回复</li>
+  <li>如果它调用了工具（比如读取目录），会出现一个可展开的工具卡片</li>
+</ul></div>
+
+<div class="fail">失败的样子（按优先级排查）：
+<ul>
+  <li>选不到 DSH：settings.json 没保存/没重启 → 回到步骤 3 检查</li>
+  <li>发送后立刻报错 "Failed to start agent"：<code>dshacp</code> 命令不可用 → 回到步骤 1 检查 <code>which dshacp</code></li>
+  <li>发送后转圈很久然后报错：模型密钥问题 → 确认 <code>~/.dsh/.credentials.yaml</code> 里有 <code>DEEPSEEK_API_KEY</code></li>
+  <li>其他情况：把错误信息告诉我（老师），或者用第 3 课的方法看 ACP 日志</li>
+</ul></div>
+
+<h2>课后巩固（2 分钟，强烈建议）</h2>
+<p>在同一线程里继续发：</p>
+<pre><code>请运行 pwd 命令，告诉我输出，然后创建一个名为 zed-test.txt 的文件，内容写 "hello from dshacp"。</code></pre>
+<p>观察三件事：</p>
+<ol>
+  <li><strong>工具卡片</strong>：出现 bash 工具卡片（显示命令），完成后卡片显示结果</li>
+  <li><strong>文件真的被创建</strong>：在 Zed 左侧文件树里能看到 zed-test.txt（如果没看到，刷新文件树）</li>
+  <li><strong>回复内容</strong>：agent 会汇报它做了什么</li>
+</ol>
+<p>这一条消息同时验证了：工具调用、工具结果渲染、真实文件写入。全部看到就算过关。</p>
+
+<h2>推荐阅读（本课的一手资料）</h2>
+<ul>
+  <li>本项目 <code>README.zh.md</code> 的 "Zed 配置" 一节——本课步骤 3 的依据</li>
+  <li>Zed 官方：<a href="https://zed.dev/docs/ai/external-agents">External Agents 文档</a>（自定义 agent 部分）</li>
+  <li>Zed 官方：<a href="https://zed.dev/docs/ai/agent-panel">Agent Panel 文档</a>（面板怎么用）</li>
+</ul>
+
+<div class="tip">有任何一步不明白、或者结果和"成功的样子"对不上，直接问我（老师）。我会根据你的具体情况调整讲解。</div>
+
+<footer>
+  第 1 课 · 在 Zed 中跑通 DSHACP · <a href="../reference/zed-verify-cheatsheet.html">验证速查卡</a>
+</footer>
+
+</body>
+</html>

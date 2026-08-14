@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>速查卡：Zed 中验证 DSHACP</title>
+<link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+
+<h1>速查卡：在 Zed 中验证 DSHACP</h1>
+
+<p>打印友好版。每个验证点给"怎么测 + 看到什么算过"。</p>
+
+<h2>一、安装与配置</h2>
+<pre><code># 1. 构建 + 全局链接（在项目目录）
+cd /Volumes/WD-1T/00_Workspace/00_Active/CodeProject/DSHACP
+npm run build
+npm link
+which dshacp       # 应输出路径；dshacp --help 显示用法说明
+
+# 2. 服务端自测（不依赖 Zed）
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"t","version":"0"}}}' | dshacp
+# 期望输出：一行 JSON，含 "loadSession":true 和 "authMethods":[]
+</code></pre>
+<p>Zed 配置（<code>~/.config/zed/settings.json</code> → <code>agent_servers</code> 里加）：</p>
+<pre><code>"DSH": {
+  "type": "custom",
+  "command": "dshacp",
+  "args": [],
+  "env": {}
+}</code></pre>
+<p>保存后 <strong>完全退出 Zed 再重开</strong>（⌘Q）。</p>
+
+<h2>二、功能验证清单</h2>
+<table>
+  <tr><th>验证点</th><th>怎么测</th><th>看到什么算过</th></tr>
+  <tr><td>流式输出</td><td>任意提问</td><td>文字逐个冒出来（不是一次性出现）</td></tr>
+  <tr><td>思考过程</td><td>问一个需要推理的问题</td><td>先出现思考内容，再出现正式回复</td></tr>
+  <tr><td>工具卡片</td><td>"运行 pwd"</td><td>bash 卡片出现 → 完成 → 卡片显示输出</td></tr>
+  <tr><td>文件写入</td><td>"创建 zed-test.txt，内容 xxx"</td><td>文件树出现该文件，内容正确</td></tr>
+  <tr><td>审批弹窗</td><td>"运行 touch ~/test-file"（写家目录）</td><td>出现权限请求：允许一次 / 始终允许 / 拒绝</td></tr>
+  <tr><td>会话列表/恢复</td><td>关闭线程 → 新线程选择历史会话</td><td>Threads 侧栏列出会话，点开能看到历史并继续对话</td></tr>
+  <tr><td>ssh 工具</td><td>"调用 ssh_list"</td><td>出现 ssh_list 工具卡片（无主机配置时返回 no hosts configured 也算工具通了）</td></tr>
+</table>
+
+<h2>三、常用调试命令</h2>
+<pre><code># 看 dshacp 服务端日志（stderr）——自己手动前台跑一个：
+dshacp    # 在终端前台运行，保持窗口开着；Zed 里操作时这里会打印诊断
+
+# 看 Zed 与 agent 之间收发的原始 ACP 报文：
+#   Zed 命令面板（⌘⇧P）→ dev: open acp logs
+</code></pre>
+
+<h2>四、快速排错表</h2>
+<table>
+  <tr><th>症状</th><th>原因 → 处理</th></tr>
+  <tr><td>选不到 DSH agent</td><td>配置没保存或没重启 → ⌘S 保存 + ⌘Q 重启</td></tr>
+  <tr><td>Failed to start agent</td><td><code>dshacp</code> 不在 PATH → <code>which dshacp</code>，重新 npm link</td></tr>
+  <tr><td>转圈后报错</td><td>密钥问题 → 检查 ~/.dsh/.credentials.yaml 的 DEEPSEEK_API_KEY</td></tr>
+  <tr><td>有回复但没有思考</td><td>正常——模型/配置决定是否输出思考，不是故障</td></tr>
+  <tr><td>审批弹窗不出现</td><td>命令在沙箱允许范围内（工作区/临时目录内操作不询问）→ 换写家目录的命令测</td></tr>
+  <tr><td>权限请求一直转圈</td><td>审批默认 10 分钟超时，超时后自动拒绝（fail-closed）→ 等它超时或取消</td></tr>
+</table>
+
+<p>详细教程见 <a href="../lessons/0001-zed-verify-dshacp.html">第 1 课</a>。不明白就问老师。</p>
+
+</body>
+</html>

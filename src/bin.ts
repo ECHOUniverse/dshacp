@@ -31,9 +31,27 @@ const snapshotMode = process.env['DSH_SNAPSHOT']
 if (snapshotMode !== 'replay') loadEnv(NAME)
 const { values } = parseArgs({
   args: process.argv.slice(2),
-  options: { config: { type: 'string', short: 'c' } },
+  options: {
+    config: { type: 'string', short: 'c' },
+    help: { type: 'boolean', short: 'h' },
+  },
   strict: true,
 })
+if (values.help) {
+  // `dshacp` is a stdio server, not an interactive CLI: Zed spawns it and
+  // speaks line-delimited JSON-RPC on stdin/stdout. The only useful flags are
+  // `--config` (override the shipped cordis.yml) and this help text.
+  process.stdout.write(
+    'dshacp — Zed-first ACP v1 server for DeepSeek Harness\n\n'
+    + 'Usage: dshacp [--config <path>]\n\n'
+    + '  -c, --config <path>   Cordis composition to boot (default: the cordis.yml shipped with this package)\n'
+    + '  -h, --help            Show this help and exit\n\n'
+    + 'This process is a stdio ACP server: it reads newline-delimited JSON-RPC\n'
+    + 'from stdin and writes responses to stdout. Configure it in Zed under\n'
+    + 'Settings → AI → External Agents as a custom agent with command "dshacp".\n',
+  )
+  process.exit(0)
+}
 const ctx = await boot(NAME, resolveConfigPath(values.config ?? SHIPPED_CONFIG, snapshotMode))
 // EOF closes the ACP connection; dispose the tree (flush persistence, drain
 // agents) and exit cleanly. The calling client (Zed) also owns process
