@@ -6,3 +6,6 @@ lib/
 *.log
 .env
 .DS_Store
+.test-home/
+.test-home-*/
+.test-sessions-*/

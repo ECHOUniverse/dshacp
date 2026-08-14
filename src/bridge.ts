@@ -25,13 +25,16 @@ import {
   type AuthenticateRequest,
   type CancelNotification,
   type CloseSessionRequest,
+  type CreateElicitationResponse,
   type DeleteSessionRequest,
+  type ElicitationSchema,
   type InitializeRequest,
   type InitializeResponse,
   type ListSessionsRequest,
   type ListSessionsResponse,
   type LoadSessionRequest,
   type LoadSessionResponse,
+  type McpServer,
   type NewSessionRequest,
   type NewSessionResponse,
   type PromptRequest,
@@ -39,13 +42,26 @@ import {
   type PlanEntryStatus,
   type ResumeSessionRequest,
   type ResumeSessionResponse,
+  type SessionConfigOption,
   type SessionInfo,
   type SessionNotification,
+  type SetSessionConfigOptionRequest,
+  type SetSessionConfigOptionResponse,
   type StopReason,
   type Stream,
   type ToolCallUpdate,
 } from '@agentclientprotocol/sdk'
-import type { Agent, AgentSetup } from '@deepseek-ai/dsh-agent'
+import { installModelSelection, type Agent, type AgentSetup, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
+import { resolveSessionPreset, type AgentPreset, type AgentPresets } from '@deepseek-ai/dsh-agent-presets'
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { isUserInvocable } from '@deepseek-ai/dsh-skill'
+import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
+import {
+  UserQuestionError,
+  type AskUserQuestionAnswer,
+  type AskUserQuestionItem,
+  type AskUserQuestionRequest,
+} from '@deepseek-ai/dsh-user-questions'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { SessionId, type Session, type SessionEvent, type TurnEndReason } from '@deepseek-ai/dsh-session'
 // Side-effect type imports: declaration-merge the event maps answered below.
@@ -53,6 +69,8 @@ import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-subagent'
 import type {} from '@deepseek-ai/dsh-workflow'
+// Declaration-merge the `agent-preset/selected` session event (P4b mode switch).
+import type {} from '@deepseek-ai/dsh-agent-presets'
 import { type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval/types'
 import {
   acpPromptToText,
@@ -67,10 +85,25 @@ import { pickDefined } from './options.ts'
 
 export const name = 'dshacp-bridge'
 /** The bridge creates and owns agents; the title service and store serve the wire. */
-export const inject = ['agents', 'sessionTitle', 'sessions']
+export const inject = ['agents', 'sessionTitle', 'sessions', 'userQuestions', 'llm']
 
 /** Default permission-request timeout: fail-closed after this long (DESIGN §7). */
 export const DEFAULT_APPROVAL_TIMEOUT_MS = 10 * 60 * 1000
+
+/** Default user-question (elicitation) timeout: fail-closed after this long (DESIGN P4b). */
+export const DEFAULT_ELICITATION_TIMEOUT_MS = 30 * 60 * 1000
+
+/** ACP config-option ids for model / thinking / mode (DESIGN §12.4). */
+export const MODEL_OPTION_ID = 'model'
+export const THINKING_OPTION_ID = 'thought_level'
+export const MODE_OPTION_ID = 'mode'
+
+/** Composition-default route, matching the base agent-default-model row. */
+export const DEFAULT_PROVIDER = 'deepseek-official'
+export const DEFAULT_MODEL = 'deepseek-v4-flash'
+
+/** Per-tool-call timeout for forwarded MCP servers (the mcp-client default). */
+export const DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS = 60_000
 
 /**
  * Fixed plan-entry priority for every mapped update (DESIGN §17): DSH todos
@@ -98,14 +131,16 @@ function internalError(detail: string): RequestError {
   return RequestError.internalError(undefined, detail)
 }
 
-/** Plugin config: provider/model selection and the approval fail-closed timeout. */
+/** Plugin config: provider/model selection, approval and elicitation timeouts. */
 export interface BridgeConfig {
-  /** Provider route for created agents; absent reuses the composition default. */
+  /** Provider route seeding created agents; absent reuses the composition default. */
   provider?: string
-  /** Model name for created agents; absent reuses the composition default. */
+  /** Model name seeding created agents; absent reuses the composition default. */
   model?: string
   /** How long a pushed permission request waits for the client before rejecting (fail-closed). */
   approvalTimeoutMs?: number
+  /** How long an elicitation (`ask_user_question`) waits for the user before failing closed. */
+  elicitationTimeoutMs?: number
   /**
    * P3 hybrid mode: when true AND the client advertised
    * `clientCapabilities.fs.writeTextFile`, the `write` tool is shadowed by a
@@ -122,6 +157,7 @@ export const Config: Schema<BridgeConfig> = Schema.object({
   provider: Schema.string(),
   model: Schema.string(),
   approvalTimeoutMs: Schema.natural().default(DEFAULT_APPROVAL_TIMEOUT_MS),
+  elicitationTimeoutMs: Schema.natural().default(DEFAULT_ELICITATION_TIMEOUT_MS),
   hybridFileWrites: Schema.boolean().default(false),
 })
 
@@ -153,6 +189,10 @@ interface SessionRecord {
     phase: string | undefined
     agents: Map<number, { label: string; phase?: string; status: PlanEntryStatus }>
   } | undefined
+  /** Per-session model selection (P4b): mutated by the `model`/`thought_level` config options. */
+  selection: ModelSelectionRef | undefined
+  /** The preset id this session runs (P4b): set at setup, updated by mode switches. */
+  preset: string | undefined
   /** Cumulative token accounting for `usage_update` (session-wide). */
   usage: {
     input: number
@@ -173,14 +213,77 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   // injected services during apply rather than reading them lazily in a callback.
   const agents = ctx.agents
   const logger = ctx.logger
+  const userQuestions = ctx.userQuestions
   const sessions = new Map<SessionId, SessionRecord>()
   const approvalTimeoutMs = config.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS
+  const elicitationTimeoutMs = config.elicitationTimeoutMs ?? DEFAULT_ELICITATION_TIMEOUT_MS
   let closed = false
   /** Whether the client advertised `fs.writeTextFile` at initialize (P3 gate). */
   let clientFsWrite = false
+  /** Whether the client advertised form elicitation at initialize (P4b gate). */
+  let clientElicitation = false
+  /** Zed-forwarded MCP servers mounted once per raw server name (P4b), disposed at quiesce. */
+  const mountedMcp = new Map<string, Promise<{ dispose: () => Promise<void> } | undefined>>()
   let conn: AgentSideConnection
 
-  /** Return the bridge-owned record for an agent, rejecting same-id impostors. */
+  /** The default-model service (base `agent-default-model` row), read structurally. */
+  const defaultModelService = (): { currentSelection(): ModelSelection } | undefined =>
+    ctx.get('agentDefaultModel') as { currentSelection(): ModelSelection } | undefined
+
+  /** The agent-presets roster (base/preset composition), read structurally. */
+  const presetRoster = (): AgentPresets | undefined => ctx.get('agentPresets') as AgentPresets | undefined
+
+  /**
+   * The mutable per-session model selection (DESIGN D8/D14). A picked value
+   * wins; otherwise the session's own `request/header` restores the last
+   * model/effort (resume), and the deployment default (agent-default-model)
+   * is the fallback. Installed on the agent once at creation; the
+   * `model`/`thought_level` config options mutate it.
+   */
+  const selectionFor = (record: SessionRecord): ModelSelectionRef => {
+    const installed = record.selection
+    if (installed !== undefined) return installed
+    let picked: ModelSelection | undefined
+    if (config.provider !== undefined || config.model !== undefined) {
+      picked = {
+        provider: config.provider ?? DEFAULT_PROVIDER,
+        model: config.model ?? DEFAULT_MODEL,
+      }
+    }
+    const selection: ModelSelectionRef = {
+      get current() {
+        if (picked !== undefined) return picked
+        const logged = record.agent.session.requestHeader()?.config
+        if (logged !== undefined) {
+          return {
+            provider: logged.provider,
+            model: logged.model,
+            ...(logged.reasoningEffort !== undefined ? { reasoningEffort: logged.reasoningEffort } : {}),
+          }
+        }
+        const defaults = defaultModelService()
+        if (defaults !== undefined) {
+          const current = defaults.currentSelection()
+          if (current !== undefined) return current
+        }
+        return { provider: DEFAULT_PROVIDER, model: DEFAULT_MODEL }
+      },
+      set current(next) {
+        picked = next
+      },
+      assembled: undefined,
+    }
+    record.selection = selection
+    return selection
+  }
+
+  /** Whether a session has produced nothing — the only state a mode switch may mutate (D9). */
+  const sessionBlank = (session: Session): boolean =>
+    !session.events.some(event => event.type === 'turn/start')
+
+  /**
+   * Return the bridge-owned record for an agent, rejecting same-id impostors.
+   */
   const ownedRecord = (agent: Agent): SessionRecord | undefined => {
     const record = sessions.get(agent.session.id)
     return record?.agent === agent ? record : undefined
@@ -218,6 +321,443 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     clearTimeout(permission.timer)
     permission.settle(outcome)
   }
+
+  // ── P4b: config options (model / thinking / mode) ─────────────────────────
+
+  /**
+   * Spread one optional field into an object literal only when defined. The
+   * literal form `...(x !== undefined ? { k: x } : {})` recurs across the
+   * option builders; this keeps the mapping one token per field while the
+   * result type stays `Pick` (unlike `pickDefined`, which spreads the whole
+   * partial source type).
+   */
+  const withDefined = <T, K extends keyof T>(source: T, key: K): Pick<T, K> =>
+    source[key] !== undefined ? { [key]: source[key] } as Pick<T, K> : {} as Pick<T, K>
+
+  /** One catalog model entry: model id/name plus optional reasoning metadata. */
+  interface CatalogModel {
+    id: string
+    name: string
+    description?: string
+    reasoning?: {
+      efforts: { id: string; name: string; description?: string }[]
+      defaultEffort?: string
+    }
+  }
+  /** One provider group of the model catalog. */
+  interface CatalogGroup {
+    id: string
+    name: string
+    models: CatalogModel[]
+  }
+
+  /**
+   * The dynamic model catalog: every registered provider's models with their
+   * reasoning metadata resolved per model (DESIGN D6). A provider that fails
+   * to answer contributes no group; the option surface never fails the wire.
+   */
+  const buildModelCatalog = async (): Promise<CatalogGroup[]> => {
+    const llm = ctx.llm
+    if (llm === undefined) return []
+    const groups = await Promise.all(llm.listProviders().map(async (provider) => {
+      try {
+        const models = await llm.listModels(provider.id)
+        const entries = await Promise.all(models.map(async (model): Promise<CatalogModel> => {
+          const resolved = await llm.resolveModelInfo(provider.id, model.id)
+          return {
+            id: model.id,
+            name: model.name,
+            ...withDefined(model, 'description'),
+            ...(resolved.reasoning !== undefined ? {
+              reasoning: {
+                efforts: resolved.reasoning.efforts.map(effort => ({
+                  id: effort.id,
+                  name: effort.name,
+                  ...withDefined(effort, 'description'),
+                })),
+                ...withDefined(resolved.reasoning, 'defaultEffort'),
+              },
+            } : {}),
+          }
+        }))
+        return { id: provider.id, name: provider.name, models: entries }
+      } catch (error: unknown) {
+        logger.warn(`dshacp: model catalog for provider "${provider.id}" failed: ${String(error)}`)
+        return { id: provider.id, name: provider.name, models: [] }
+      }
+    }))
+    return groups.filter(group => group.models.length > 0)
+  }
+
+  /**
+   * The complete configOptions list for one session (DESIGN §12.4, D3/D7).
+   * @param record - the session whose options to render.
+   * @param groups - a caller-provided model catalog (the apply path builds one
+   *   catalog for both the mutation and the response); built here when absent.
+   */
+  const buildConfigOptions = async (
+    record: SessionRecord,
+    groups?: CatalogGroup[],
+  ): Promise<SessionConfigOption[]> => {
+    const catalog = groups ?? await buildModelCatalog()
+    const selection = selectionFor(record).current ?? { provider: DEFAULT_PROVIDER, model: DEFAULT_MODEL }
+    const options: SessionConfigOption[] = []
+    const flatModels = catalog.flatMap(group => group.models)
+    // Model select: flat when one provider route, grouped otherwise.
+    const modelOptions = catalog.length > 1
+      ? catalog.map(group => ({
+          group: group.id,
+          name: group.name,
+          options: group.models.map(model => ({
+            name: model.name,
+            value: model.id,
+            ...withDefined(model, 'description'),
+          })),
+        }))
+      : (catalog[0]?.models.map(model => ({
+          name: model.name,
+          value: model.id,
+          ...withDefined(model, 'description'),
+        })) ?? [])
+    options.push({
+      id: MODEL_OPTION_ID,
+      name: 'Model',
+      category: 'model',
+      type: 'select',
+      currentValue: selection.model,
+      options: modelOptions,
+    })
+    // Thinking select: only when the current model exposes reasoning efforts.
+    const currentInfo = flatModels.find(model => model.id === selection.model)
+    const efforts = currentInfo?.reasoning?.efforts ?? []
+    if (efforts.length > 0) {
+      const currentEffort = selection.reasoningEffort
+        ?? currentInfo?.reasoning?.defaultEffort
+        ?? efforts[0]!.id
+      options.push({
+        id: THINKING_OPTION_ID,
+        name: 'Thinking',
+        category: 'thought_level',
+        type: 'select',
+        currentValue: currentEffort,
+        options: efforts.map(effort => ({
+          name: effort.name,
+          value: effort.id,
+          ...withDefined(effort, 'description'),
+        })),
+      })
+    }
+    // Mode select: the preset roster (DESIGN D3/D9).
+    const presets = presetRoster()
+    if (presets !== undefined) {
+      const roster = await presets.list()
+      options.push({
+        id: MODE_OPTION_ID,
+        name: 'Mode',
+        category: 'mode',
+        type: 'select',
+        currentValue: record.preset ?? presets.defaultId,
+        options: roster
+          .filter(preset => preset.broken === undefined)
+          .map(preset => ({
+            name: preset.name ?? preset.id,
+            value: preset.id,
+            ...withDefined(preset, 'description'),
+          })),
+      })
+    }
+    return options
+  }
+
+  /**
+   * Apply one `session/set_config_option` (DESIGN §12.4.3). Model and thinking
+   * validate through the llm runtime before mutating the selection; a model
+   * switch resets thinking to the model's default effort (D8). A mode switch
+   * recomposes only a blank session; a started session soft-rejects (returns
+   * the unchanged list and logs) because its tool set is fixed by the log.
+   * @returns the model catalog the apply path built (the model branch), so
+   *   the response can reuse it instead of re-resolving every model.
+   */
+  const applyConfigOption = async (
+    record: SessionRecord,
+    params: SetSessionConfigOptionRequest,
+  ): Promise<CatalogGroup[] | undefined> => {
+    if ('type' in params) {
+      throw invalidParams(`config option "${params.configId}" is a select, not a boolean`)
+    }
+    const selection = selectionFor(record)
+    if (params.configId === MODEL_OPTION_ID) {
+      const groups = await buildModelCatalog()
+      const provider = groups.find(group => group.models.some(model => model.id === params.value))?.id
+      if (provider === undefined) throw invalidParams(`unknown model: ${params.value}`)
+      let info: { reasoning?: { defaultEffort?: string; efforts: readonly { id: string }[] } }
+      try {
+        // Validate through the llm runtime exactly like the web app's model
+        // picker (DESIGN §12.4.3), then read the target model's metadata.
+        await ctx.llm.resolveCallConfig({ provider, model: params.value })
+        info = await ctx.llm.resolveModelInfo(provider, params.value)
+      } catch (error: unknown) {
+        throw invalidParams(`unknown model: ${params.value} (${String(error)})`)
+      }
+      // D8: switching model resets thinking to that model's default effort.
+      // Without an adapter default, pin the first offered effort so the
+      // stored selection and the displayed option agree.
+      const defaultEffort = info.reasoning?.defaultEffort ?? info.reasoning?.efforts[0]?.id
+      selection.current = {
+        provider,
+        model: params.value,
+        ...(defaultEffort !== undefined ? { reasoningEffort: ReasoningEffortId(defaultEffort) } : {}),
+      }
+      return groups
+    } else if (params.configId === THINKING_OPTION_ID) {
+      const current = selection.current
+      if (current === undefined) throw invalidParams('no model is selected for this session')
+      try {
+        await ctx.llm.resolveCallConfig({
+          provider: current.provider,
+          model: current.model,
+          reasoningEffort: ReasoningEffortId(params.value),
+        })
+      } catch (error: unknown) {
+        throw invalidParams(`unsupported reasoning effort for ${current.model}: ${params.value} (${String(error)})`)
+      }
+      selection.current = {
+        provider: current.provider,
+        model: current.model,
+        reasoningEffort: ReasoningEffortId(params.value),
+      }
+    } else if (params.configId === MODE_OPTION_ID) {
+      const presets = presetRoster()
+      if (presets === undefined) throw invalidParams('this deployment composes no agent presets')
+      if (!sessionBlank(sessionOf(record))) {
+        // DESIGN D9: the mode is fixed once a session has started — return the
+        // old value and log; no exception (Zed's dropdown snaps back).
+        logger.warn(`dshacp: mode switch to "${params.value}" refused: session ${params.sessionId} has already started`)
+        return
+      }
+      try {
+        const preset: AgentPreset = await presets.recompose(record.agent.ctx, params.value)
+        sessionOf(record).append('agent-preset/selected', { agentPreset: preset.id })
+        record.preset = preset.id
+        // Presets differ in which skill tooling they mount; refresh the
+        // `/`-menu catalog for the new composition.
+        void pushAvailableCommands(record)
+      } catch (error: unknown) {
+        throw invalidParams(`cannot switch mode: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    } else {
+      throw invalidParams(`unknown config option: ${params.configId}`)
+    }
+  }
+
+  // ── P4b: slash commands over userInvocable skills ─────────────────────────
+
+  /**
+   * Push the `/`-menu catalog: every `userInvocable` skill of this session's
+   * scope (DESIGN D10). Invocation itself needs no bridge code — the preset's
+   * `tool-skill` pre-step hook already injects `renderSkillContent` for
+   * `/name` gestures in user messages.
+   */
+  const pushAvailableCommands = async (record: SessionRecord): Promise<void> => {
+    const skills = ctx.get('skills')
+    if (skills === undefined) return
+    try {
+      const session = sessionOf(record)
+      const summaries = await skills.list({ cwd: session.header.cwd, scope: record.agent })
+      const availableCommands = summaries
+        .filter(isUserInvocable)
+        .map(summary => ({ name: summary.name, description: summary.description }))
+      notify({
+        sessionId: session.id,
+        update: { sessionUpdate: 'available_commands_update', availableCommands },
+      })
+    } catch (error: unknown) {
+      logger.warn(`dshacp: available commands update failed: ${String(error)}`)
+    }
+  }
+
+  // ── P4b: MCP forwarding (session/new mcpServers → dsh-mcp-client) ─────────
+
+  /** Sanitize a forwarded server name into the `[A-Za-z0-9_-]{1,32}` namespace. */
+  const sanitizeServerName = (name: string): string => {
+    const base = name.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 32)
+    return base.length > 0 ? base : 'mcp'
+  }
+
+  /**
+   * Mount Zed-forwarded MCP servers as `dsh-mcp-client` plugin instances
+   * (DESIGN D12). Servers are keyed by their raw wire name and mounted once
+   * process-wide — DSH's MCP model is composition-global — so a later session
+   * forwarding the same server reuses the live instance. Stdio is the spec's
+   * mandatory transport; http maps to `streamable-http`; sse and acp are
+   * unsupported and skipped with a diagnostic. A failed mount never fails the
+   * session.
+   */
+  const forwardMcpServers = async (servers: readonly McpServer[] | undefined): Promise<void> => {
+    if (servers === undefined || servers.length === 0) return
+    for (const server of servers) {
+      if ('type' in server && (server.type === 'sse' || server.type === 'acp')) {
+        logger.warn(`dshacp: mcp server "${server.name}" uses the ${server.type} transport, which is not supported; skipped`)
+        continue
+      }
+      if (mountedMcp.has(server.name)) {
+        logger.info(`dshacp: mcp server "${server.name}" is already forwarded; reusing its tools`)
+        continue
+      }
+      const serverName = sanitizeServerName(server.name)
+      const config = 'type' in server
+        ? {
+            transport: 'streamable-http' as const,
+            serverName,
+            url: server.url,
+            headers: Object.fromEntries(server.headers.map(header => [header.name, header.value])),
+            toolCallTimeoutMs: DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS,
+            failOnStartupError: false,
+          }
+        : {
+            transport: 'stdio' as const,
+            serverName,
+            command: server.command,
+            args: server.args,
+            env: Object.fromEntries(server.env.map(entry => [entry.name, entry.value])),
+            // The child inherits the process cwd (the project root Zed launches from).
+            cwd: process.cwd(),
+            toolCallTimeoutMs: DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS,
+            failOnStartupError: false,
+          }
+      const mount = (async () => {
+        try {
+          const plugin = await ctx.plugin(mcpClient, config)
+          return plugin as unknown as { dispose: () => Promise<void> }
+        } catch (error: unknown) {
+          logger.warn(`dshacp: forwarding mcp server "${server.name}" failed: ${String(error)}`)
+          mountedMcp.delete(server.name)
+          return undefined
+        }
+      })()
+      mountedMcp.set(server.name, mount)
+      await mount
+    }
+  }
+
+  // ── P4b: elicitation (ask_user_question → session/request_elicitation) ────
+
+  /**
+   * Race an elicitation against the owning tool call's abort signal and the
+   * fail-closed timeout, so a cancelled turn or a silent user never leaves
+   * the agent loop hanging.
+   */
+  const raceElicitation = (
+    promise: Promise<CreateElicitationResponse>,
+    signal: AbortSignal | undefined,
+    timeoutMs: number,
+  ): Promise<CreateElicitationResponse> => new Promise((resolve, reject) => {
+    let settled = false
+    const onAbort = (): void => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(new UserQuestionError('the question was aborted', 'ABORTED'))
+    }
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(new UserQuestionError('the user did not answer in time', 'TIMEOUT'))
+    }, timeoutMs)
+    timer.unref?.()
+    const cleanup = (): void => {
+      clearTimeout(timer)
+      signal?.removeEventListener?.('abort', onAbort)
+    }
+    if (signal?.aborted === true) {
+      onAbort()
+      return
+    }
+    signal?.addEventListener?.('abort', onAbort, { once: true })
+    promise.then(
+      (result) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolve(result)
+      },
+      (error: unknown) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(error)
+      },
+    )
+  })
+
+  /**
+   * The DSH user-questions provider backed by ACP elicitation: the tool
+   * pauses until Zed renders a form from the question schema and the user
+   * answers (DESIGN D13, P4b-4). Decline/cancel/timeout fail the tool call
+   * closed through the ordinary result pipeline.
+   */
+  const askViaElicitation = async (request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer> => {
+    const record = request.agent !== undefined ? ownedRecord(request.agent) : undefined
+    if (record === undefined) {
+      throw new UserQuestionError('the asking agent is not a live DSHACP session', 'CALLER_NOT_LIVE')
+    }
+    if (conn === undefined) {
+      throw new UserQuestionError('the ACP connection is not ready', 'CONNECTION_NOT_READY')
+    }
+    if (!clientElicitation) {
+      throw new UserQuestionError('the ACP client does not advertise elicitation; ask_user_question is unavailable', 'CLIENT_UNSUPPORTED')
+    }
+    const properties: ElicitationSchema['properties'] = {}
+    const required: string[] = []
+    for (const [index, question] of request.questions.entries()) {
+      const key = `q${index}`
+      const description = question.detail !== undefined
+        ? `${question.question}\n\n${question.detail}`
+        : question.question
+      const labels = question.options?.map(option => option.label) ?? []
+      if (question.multiSelect === true) {
+        properties[key] = { type: 'array', description, items: { type: 'string', enum: labels } }
+      } else if (labels.length > 0) {
+        properties[key] = { type: 'string', description, enum: labels }
+      } else {
+        properties[key] = { type: 'string', description }
+      }
+      required.push(key)
+    }
+    const message = request.questions.map(question => question.question).join(' ')
+    const response = await raceElicitation(
+      conn.unstable_createElicitation!({
+        mode: 'form',
+        message,
+        sessionId: sessionOf(record).id,
+        requestedSchema: { type: 'object', properties, required },
+      }),
+      request.signal,
+      elicitationTimeoutMs,
+    )
+    if (response.action !== 'accept') {
+      throw new UserQuestionError(
+        response.action === 'cancel'
+          ? 'the user cancelled the question'
+          : 'the user declined the question',
+        'USER_DECLINED',
+      )
+    }
+    const answers = request.questions.map((question, index) => {
+      const value = response.content?.[`q${index}`]
+      const selected = Array.isArray(value)
+        ? value.map(String)
+        : value !== undefined && value !== null
+          ? [String(value)]
+          : []
+      return { id: question.id, selected }
+    })
+    return { answers }
+  }
+
+  // The single UI provider slot belongs to this bridge for the whole process.
+  userQuestions.registerProvider({ ask: askViaElicitation })
 
   /** Accumulate one call's token accounting and report the session-wide total. */
   const accumulateUsage = (
@@ -369,6 +909,12 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     if (inflight !== undefined && inflight.messageId === message.id) inflight.turn = turn
   })
 
+  // The `/`-menu catalog tracks the skill catalog: an authoring change (a
+  // skill created or removed) refreshes every live session's commands.
+  ctx.on('skills/change', () => {
+    for (const record of sessions.values()) void pushAvailableCommands(record)
+  })
+
   ctx.on('agent/error', ({ agent, turn, error }) => {
     const record = ownedRecord(agent)
     const inflight = record?.inflight
@@ -434,23 +980,27 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   /** Reject same-session features outside the supported surface (P1). */
   const validateSessionParams = (params: NewSessionRequest): void => {
     if (!isAbsolute(params.cwd)) throw invalidParams(`cwd must be an absolute path: ${params.cwd}`)
-    // `mcpServers` is a required v1 param; accept and ignore in P1 (DESIGN §5).
+    // `mcpServers` is a required v1 param; P4b forwards it into dsh-mcp-client.
     if (params.additionalDirectories !== undefined && params.additionalDirectories.length > 0) {
-      logger.info('dshacp: additionalDirectories is accepted but not applied in P1')
+      logger.info('dshacp: additionalDirectories is accepted but not applied')
     }
   }
 
   /**
-   * P3 hybrid mode: when enabled AND the client advertised
-   * `clientCapabilities.fs.writeTextFile`, return an agent setup that shadows
-   * the global `write` tool with a per-agent tool delegating to the client's
-   * `fs/write_text_file`. Zed applies the edit to its buffers and offers
-   * per-hunk diff review; everything else stays DSH-owned. Relative paths
-   * resolve against the session cwd (the ACP wire requires absolute paths).
+   * Per-agent setup (DESIGN §12.4.2): compose the agent from the preset the
+   * session runs and, in P3 hybrid mode, shadow the global `write` tool with
+   * a per-agent tool delegating to the client's `fs/write_text_file` when the
+   * client advertised `clientCapabilities.fs.writeTextFile`. Zed applies the
+   * edit to its buffers and offers per-hunk diff review; everything else
+   * stays DSH-owned. Relative paths resolve against the session cwd (the ACP
+   * wire requires absolute paths).
+   *
+   * The preset id resolves from the session itself: the creation header names
+   * it for fresh sessions (`agentPreset` in `meta`), and a loaded log's last
+   * `agent-preset/selected` event wins for resume (DESIGN D14).
    */
-  const hybridSetup = (sessionId: SessionId, cwd: string): AgentSetup | undefined => {
-    if (config.hybridFileWrites !== true || !clientFsWrite) return undefined
-    return (agentCtx) => {
+  const composeSetup = (sessionId: SessionId, cwd: string): AgentSetup => async (agentCtx) => {
+    if (config.hybridFileWrites === true && clientFsWrite) {
       agentCtx.tools.register(defineTool({
         name: 'write',
         description: 'Create or fully replace a UTF-8 text file. The file is written by the client editor (hybrid mode), so the change appears as a reviewable diff.',
@@ -513,6 +1063,17 @@ export function apply(ctx: Context, config: BridgeConfig): void {
           return { path: target, operation: 'client-write', before: null, after: args.content }
         },
       }))
+    }
+    // Compose the agent from the preset the session runs. The roster mount is
+    // the one supported call site: while the agent is still unpublished, a
+    // rejected composition rolls the whole creation back.
+    const presets = presetRoster()
+    const agent = agentCtx.agent
+    if (presets !== undefined) {
+      const presetId = agent !== undefined
+        ? resolveSessionPreset(agent.session) ?? presets.defaultId
+        : presets.defaultId
+      if (presetId !== undefined) await presets.mount(agentCtx, presetId)
     }
   }
 
@@ -676,12 +1237,20 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     permission: undefined,
     allowedTools: new Set(),
     workflow: undefined,
+    selection: undefined,
+    preset: undefined,
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
   })
 
   /** ISO timestamp of the log's last event, or null for an empty log. */
   const lastUpdated = (events: readonly { time: number }[]): string | null =>
     events.length > 0 ? new Date(events[events.length - 1]!.time).toISOString() : null
+
+  /** Install the per-session model selection and record the running preset (P4b). */
+  const adoptRecord = (record: SessionRecord): void => {
+    installModelSelection(record.agent.ctx, selectionFor(record))
+    record.preset = resolveSessionPreset(record.agent.session) ?? presetRoster()?.defaultId
+  }
 
   /** Resume a persisted session into the bridge, rejecting when already open. */
   const resumeRecord = async (sessionId: SessionId, cwd: string): Promise<SessionRecord> => {
@@ -690,7 +1259,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     const handle = await agents.resume({
       resumeSessionId: sessionId,
       ...(Object.keys(agentOptions()).length > 0 ? { agentOptions: agentOptions() } : {}),
-      ...(hybridSetup(sessionId, cwd) !== undefined ? { setup: hybridSetup(sessionId, cwd) } : {}),
+      setup: composeSetup(sessionId, cwd),
     })
     if (closed) {
       await handle.dispose()
@@ -698,6 +1267,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     }
     const record = makeRecord(handle)
     sessions.set(sessionId, record)
+    adoptRecord(record)
     return record
   }
 
@@ -791,6 +1361,9 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         // P3 gate: hybrid file writes are only offered when the client can
         // apply them (Zed advertises fs.writeTextFile: true).
         clientFsWrite = params.clientCapabilities?.fs?.writeTextFile === true
+        // P4b gate: elicitation is only offered when the client can render it
+        // (Zed advertises elicitation.form).
+        clientElicitation = params.clientCapabilities?.elicitation?.form !== undefined
         // Single-version agent: the spec's "same version if supported, else
         // the latest supported" both resolve to this server's one version.
         return Promise.resolve({
@@ -800,6 +1373,10 @@ export function apply(ctx: Context, config: BridgeConfig): void {
             loadSession: true,
             promptCapabilities: {},
             sessionCapabilities: { list: {}, resume: {}, close: {}, delete: {} },
+            // P4b: HTTP MCP servers are forwarded into dsh-mcp-client. Stdio is
+            // mandatory per the spec (no capability field); sse/acp are not
+            // advertised and are skipped when a client sends them anyway.
+            mcpCapabilities: { http: true },
             auth: {},
           },
           authMethods: [],
@@ -816,31 +1393,58 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         assertOpen()
         validateSessionParams(params)
         const sessionId = SessionId(randomUUID())
+        // Resolve the starting preset before the session exists so the header
+        // can record it (a preset discovered during setup could never reach
+        // the snapshot); setup then mounts exactly what the header names. A
+        // broken default fails loud here, exactly like the web app.
+        const presets = presetRoster()
+        const presetId = presets !== undefined ? (await presets.resolve(undefined)).id : undefined
         const handle = await agents.create({
           sessionId,
-          meta: { cwd: params.cwd },
+          meta: {
+            cwd: params.cwd,
+            ...(presetId !== undefined ? { agentPreset: presetId } : {}),
+          },
           ...(Object.keys(agentOptions()).length > 0 ? { agentOptions: agentOptions() } : {}),
-          ...(hybridSetup(sessionId, params.cwd) !== undefined ? { setup: hybridSetup(sessionId, params.cwd) } : {}),
+          setup: composeSetup(sessionId, params.cwd),
         })
         /* v8 ignore next 4 -- a real stdio close can race an in-flight create. */
         if (closed) {
           await handle.dispose()
           throw internalError('connection closed during session/new')
         }
-        sessions.set(sessionId, makeRecord(handle))
-        return { sessionId }
+        const record = makeRecord(handle)
+        sessions.set(sessionId, record)
+        adoptRecord(record)
+        // Zed-forwarded MCP servers mount before the response so the first
+        // prompt already sees their tools (a failed server never fails the
+        // session; D12).
+        await forwardMcpServers(params.mcpServers)
+        void pushAvailableCommands(record)
+        return { sessionId, configOptions: await buildConfigOptions(record) }
       },
 
       async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
         const sessionId = SessionId(params.sessionId)
         const record = await resumeRecord(sessionId, params.cwd)
         replaySession(record)
-        return {}
+        void pushAvailableCommands(record)
+        await forwardMcpServers(params.mcpServers)
+        return { configOptions: await buildConfigOptions(record) }
       },
 
       async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
-        await resumeRecord(SessionId(params.sessionId), params.cwd)
-        return {}
+        const record = await resumeRecord(SessionId(params.sessionId), params.cwd)
+        void pushAvailableCommands(record)
+        await forwardMcpServers(params.mcpServers)
+        return { configOptions: await buildConfigOptions(record) }
+      },
+
+      async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
+        assertOpen()
+        const record = requireSession(SessionId(params.sessionId))
+        const catalog = await applyConfigOption(record, params)
+        return { configOptions: await buildConfigOptions(record, catalog) }
       },
 
       async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
@@ -980,6 +1584,17 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       const disposals = await Promise.allSettled(records.map(record => record.dispose()))
       const failures: unknown[] = []
       for (const result of disposals) {
+        if (result.status === 'rejected') failures.push(result.reason as unknown)
+      }
+      // Zed-forwarded MCP servers are process-global mounts owned by this
+      // bridge; they unwind with the connection (P4b).
+      const mcpMounts = [...mountedMcp.values()]
+      mountedMcp.clear()
+      const mcpResults = await Promise.allSettled(mcpMounts.map(async (mount) => {
+        const mounted = await mount
+        if (mounted !== undefined) await mounted.dispose()
+      }))
+      for (const result of mcpResults) {
         if (result.status === 'rejected') failures.push(result.reason as unknown)
       }
       if (failures.length > 0) {

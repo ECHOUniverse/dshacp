@@ -5,16 +5,18 @@ import assert from 'node:assert/strict'
 import { readFile, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { PROJECT_ROOT, hasModelCredential, spawnBridge, waitFor } from './harness.mjs'
+import { PROJECT_ROOT, TEST_HOME, TEST_SESSIONS, hasModelCredential, makeTestHome, spawnBridge, waitFor } from './harness.mjs'
 
-const SESSIONS = `${PROJECT_ROOT}/.test-sessions`
-const PROMPT_AVAILABLE = await hasModelCredential()
+const PROMPT_AVAILABLE = hasModelCredential()
 console.error(`[dshacp e2e] model credential ${PROMPT_AVAILABLE ? 'available' : 'NOT available (prompt tests skipped)'}`)
 
 let bridge
 
 before(async () => {
-  await rm(SESSIONS, { recursive: true, force: true })
+  await rm(TEST_SESSIONS, { recursive: true, force: true })
+  // Rebuild the harness home (the host machine's DSH_HOME settings must not
+  // decide sandbox/approval behavior under test).
+  makeTestHome()
   bridge = spawnBridge()
   // Give the tree time to boot; initialize retries until it answers.
   await waitFor(async () => {
@@ -33,7 +35,8 @@ before(async () => {
 
 after(async () => {
   await bridge?.stop()
-  await rm(SESSIONS, { recursive: true, force: true })
+  await rm(TEST_SESSIONS, { recursive: true, force: true })
+  await rm(TEST_HOME, { recursive: true, force: true })
   await rm(join(homedir(), 'dshacp-approval-probe'), { force: true })
   await rm(join(homedir(), 'dshacp-allow-always-1'), { force: true })
   await rm(join(homedir(), 'dshacp-allow-always-2'), { force: true })

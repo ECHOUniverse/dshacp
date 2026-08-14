@@ -37,6 +37,7 @@ Key facts driving this shape:
 - Zed's per-hunk "Review Changes" diff UI — requires fs delegation, so P3.
 - `allow_always` / `reject_always` permission options — P2 evaluation.
 - ACP `session/set_mode` / modes; elicitation; MCP client tools (`mcpServers` is received but ignored).
+  **↳ Superseded by §12 (P4):** modes move to config options, elicitation and MCP forwarding land in P4b.
 - Zed-side cross-restart persistence (that is Zed's own concern, not ours).
 
 ## 4. Decision record (final)
@@ -75,7 +76,8 @@ Key facts driving this shape:
 
 ### Deliberately NOT implemented
 - `authenticate` / `logout` — advertise `authMethods: []` ⇒ Zed must not call them.
-- `session/set_mode` — do not advertise modes.
+- `session/set_mode` — do not advertise modes. **↳ Superseded by §12 (P4):** modes move to
+  `select` config options (`category: "mode"`); `set_mode` stays unimplemented.
 
 ### `initialize` negotiation (response)
 ```jsonc
@@ -268,3 +270,155 @@ DSH's `approval/request` is a **synchronous waterfall**; ACP's `session/request_
 - Local DSH checkout: `/Users/hanxu/.nvm/versions/node/v26.5.0/lib/node_modules/@deepseek-ai/dsh/`
 - Full fact sheets (research): `../ACP-fact-sheet.md`, `./zed-acp-integration-fact-sheet.md`,
   `./DSH-extension-facts.md`.
+
+---
+
+## 12. Phase 4 (P4) — DSHACP as a thin ACP bridge over `dsh-base` + presets
+
+> **Supersedes §3/§5**: the "no `session/set_mode`, no modes, no elicitation, MCP ignored"
+> stances are replaced below. Research: `./P4-acp-config-and-dsh-presets.md`.
+
+### 12.1 Goal
+
+Make Zed a first-class DSH front-end that **inherits DSH's configured surface** instead of
+re-implementing it: (1) switch model / thinking strength / agent mode directly in the Zed panel;
+(2) slash commands that invoke skills; (3) all of DSH's tools — skills, tools, MCP, and plugin
+user-tools — available to the model, owned by DSH's own configuration.
+
+### 12.2 Architecture
+
+```
+Zed (ACP v1 stdio)
+   ↓
+dshacp (headless composition, boot dsh-app-boot)
+   ├─ dsh-base/cordis.patch.yml                ← official host core: registries + sandbox/approval + ALL tools
+   ├─ disable the base agent-plane tool rows    ← the web-app's disable list (see below)
+   ├─ dsh-agent-presets { default: standard }   ← per-session preset (standard/cordis/code/minimal = the modes)
+   ├─ dsh-mcp-client                            ← DSH-side MCP config
+   ├─ ssh (and other plugin user-tools, host-plane)
+   └─ ACP bridge (the only bespoke surface): sessions / streaming / approval /
+       config options / slash commands / elicitation / MCP forwarding
+   └─ NOT mounted: api-gateway, webserver, web-runtime, ui-* (headless; stdout = JSON-RPC)
+```
+
+The key discovery driving this: `dsh-base/cordis.patch.yml` already ships every tool
+(`tool-goal`, `plan-mode`, `tool-web`+`web`/`web-search-deepseek`, `tool-fs-search`,
+`user-questions`/ask-user, subagent family, workflow, ralph, todo, str-replace-editor,
+compaction, spill, …); the web app makes them per-session by disabling the base agent-plane rows
+and mounting `dsh-agent-presets`. DSHACP's current `cordis.yml` + `spineComposition` is a partial,
+drifting copy that omits presets entirely — this is why "DSH's configured tools/modes" were
+unavailable. Phase 4 replaces that copy with the real thing.
+
+### 12.3 Decision record (final)
+
+| # | Decision | Conclusion |
+|---|---|---|
+| D1 | Scope | Model + thinking strength + agent mode + slash commands, all in P4 |
+| D2 | Architecture | Rebuild on `dsh-base` + `dsh-agent-presets`; refactor-first, features-after |
+| D3 | Model / thinking / mode UX | `select` config options (`category` `model` / `thought_level` / `mode`) |
+| D4 | Slash commands | `available_commands_update` |
+| D5 | UX contract | Zed ACP native (dropdowns + `/` menu); no fake native model picker |
+| D6 | Value source | Dynamic enum (`llm.listModels`+`resolveModelInfo.reasoning.efforts`; `agentPresets.list`) |
+| D7 | Defaults | Zed `default_config_options` authoritative; mode default via config-option id (not `default_mode`) |
+| D8 | Model↔thinking linkage | Switching model resets thinking to that model's `defaultEffort`, resends full `configOptions` |
+| D9 | Mode lock | Blank-session `recompose`; non-blank → soft-reject (return old value + stderr), no exception |
+| D10 | Slash catalog | Only `userInvocable` skills; no plugin/basic/subagent-family tools |
+| D11 | Goal | Mounted via base+preset; exposed to the model (`get_goal`/`create_goal`/`update_goal`) |
+| D12 | MCP | Both: DSH-side `dsh-mcp-client` + Zed-forwarded `mcpServers` merged |
+| D13 | Full toolset | `web_search` ✅ · `ask_user_question` ✅ (needs ACP elicitation) · `plan-mode` ✅ |
+| D14 | Persistence | Model/thinking in `request/header`; mode in `agent-preset/selected`; resume restores for free |
+
+### 12.4 ACP bridge changes
+
+1. **`initialize`**: advertise `mcpCapabilities: { http: true }` (http forwarding into
+   `dsh-mcp-client`; stdio is mandatory per the spec and has no capability field; sse/acp are
+   not advertised and are skipped with a diagnostic when a client sends them anyway).
+   Elicitation has no agent-side capability field in the SDK — the gate is the client's
+   `clientCapabilities.elicitation.form`, captured at initialize.
+2. **`session/new`**: `setup(agentCtx)` mounts the preset (`agentPresets.mount(agentCtx, id)`,
+   id resolved from the session: the creation header for fresh sessions, the loaded log's last
+   `agent-preset/selected` for resume); return `configOptions` (three `select` options:
+   model / thinking / mode); after creation push `available_commands_update`
+   (`userInvocable` skills); await `mcpServers` forwarding. `session/load` and `session/resume`
+   return `configOptions` the same way.
+3. **`session/set_config_option`** (implemented `setSessionConfigOption`):
+   - model/thinking → validate via `llm.resolveCallConfig` → set `ModelSelectionRef.current`
+     (`installModelSelection` installed per record after creation); on model change reset
+     thinking to that model's `defaultEffort`.
+   - mode → blank-session `agentPresets.recompose` (+ durable `agent-preset/selected` event),
+     else soft-reject (return the unchanged list + stderr warn).
+   - always respond with the **complete** `configOptions` list.
+4. **`session/set_mode`**: not implemented (config options supersede modes; Zed ignores modes
+   when options are present).
+5. **Slash `/name`**: the catalog is `ctx.skills.list({cwd, scope: agent})` filtered to
+   `userInvocable` → `available_commands_update`; invocation needs no bridge code — the
+   preset's `tool-skill` pre-step hook already injects `renderSkillContent(skill)` for `/name`
+   gestures (deterministic skill run). `skills/change` refreshes every live session's catalog.
+6. **MCP**: `session/new.mcpServers` (and load/resume) are forwarded into `dsh-mcp-client`
+   plugin instances, keyed by raw server name and mounted once process-wide (DSH's MCP model
+   is composition-global); a failed or unsupported server is logged and skipped, never failing
+   the session; mounts unwind at quiesce.
+7. **Keep**: token streaming, reasoning chunks, tool-call cards, approval bridge, session
+   management (list/load/resume/delete/close/cancel), P3 hybrid `write`.
+8. **Elicitation**: the bridge registers the single `ctx.userQuestions` provider; `ask()`
+   maps `AskUserQuestionItem[]` to a form `requestedSchema` and races
+   `unstable_createElicitation` against the tool call's abort signal and
+   `elicitationTimeoutMs` (default 30 min, fail-closed). Decline/cancel/timeout fail the tool
+   call closed through the ordinary result pipeline; a client without `elicitation.form` gets
+   `CLIENT_UNSUPPORTED`.
+
+### 12.7 P4 implementation notes (beyond the plan)
+
+- **The user's DSH configuration is inherited wholesale** — including `permission.defaultPreset`
+  from `~/.dsh/settings.yaml`: `dsh-permission-presets` pins every fresh session's
+  `sandbox/mode` + `approval/policy` events from the user's chosen preset, exactly as the web
+  app does. A user who configured `danger-full-access` gets unconfined sessions (no approval
+  pushes); the e2e suite isolates from the host machine by running under a temporary
+  `DSH_HOME` that pins `workspace-write`.
+- **`agentPresets` roster roots**: the shipped root is `@deepseek-ai/dsh/config/agent-presets`
+  (the same assembly fact the web app uses), resolved by `lib/bin.js` and exposed to the
+  `agent-presets` row's `!!js` expression via a boot-provided value; the user root
+  (`<dshHome>/.agent-presets`) is appended automatically.
+- **Model selection seeding**: the `dshacp` row's optional `provider`/`model` still seed each
+  session's selection; absent that, the fallback chain is the session's `request/header`
+  (resume restore) then `agent-default-model` (composition default + settings).
+- **Model option values** are model ids (provider discovered from the catalog on set); the
+  catalog is grouped by provider when more than one route is live. The model branch validates
+  through `llm.resolveCallConfig` (the web picker's exact mechanism) and reads the target
+  model's metadata for the D8 thinking reset; a target without an adapter `defaultEffort`
+  pins the first offered effort so the stored selection and the displayed option always
+  agree.
+- **`thought_level` is conditional**: the option is emitted only when the current model
+  exposes reasoning efforts (a non-reasoning model gets model + mode only) — Zed renders
+  exactly the options it receives, and a selector over a non-existent knob would be noise.
+- **DSH-side MCP (D12 "both")**: the DSH-configured half is ordinary composition — a
+  deployment adds `@deepseek-ai/dsh-mcp-client` rows to its own `--config` leaf (the same
+  model the web app uses); the Zed-forwarded half is the dynamic `mcpServers` mounting in
+  the bridge. Both register into the same `ctx.tools` registry under `mcp__<server>__<tool>`.
+- **Tool-kind mapping for MCP tools**: `mcp__*` names fall through `toolKindForName` to
+  `other` (the rule-based tail) — a forwarded MCP tool renders as a generic tool card.
+
+### 12.5 Implementation order (refactor-first)
+
+- **P4a — refactor** ✅ (implemented; e2e-tested): `cordis.yml`/`spineComposition` replaced with
+  `dsh-base` + the web-app's disable list (`dshacp.patch.yml`) + `dsh-agent-presets`
+  (+ `dsh-mcp-client`); the now-duplicated spine rows are deleted; the ACP bridge and ssh
+  survive; the e2e suite re-runs green; headless verified (no bound port, stdout pure).
+  `lib/bin.js` resolves the `dsh-base/cordis.patch.yml` bundle patch and the shipped overlay
+  through `boot()`'s patches parameter; the shipped preset root (`@deepseek-ai/dsh/config/
+  agent-presets`, the same root the web app uses) is exposed to the `agent-presets` row
+  through a boot-provided value.
+- **P4b — features** ✅ (implemented; e2e-tested): (1) config options (model/thinking/mode) →
+  (2) slash commands → (3) MCP forwarding → (4) ACP elicitation for `ask_user_question`.
+
+### 12.6 Risks
+
+- **Base-vs-spine overlap** ✅ resolved: the spine copy is gone; `dsh-base` is the one source of
+  the host core, and the disable list mirrors `dsh-web-app`'s so a reordered base cannot
+  silently resurrect agent-plane rows.
+- **Headless constraint** ✅: no webserver/HMR; stdout reserved for JSON-RPC (verified by the
+  e2e suite, which drives the built bin over stdio).
+- **Elicitation** ✅ implemented last, as planned; the single `userQuestions` provider slot is
+  the bridge's, and the gate is the client's advertised capability.
+- **Existing e2e** ✅ re-verified after the refactor; the harness now runs under an isolated
+  `DSH_HOME` so the host machine's DSH settings cannot decide behavior under test.

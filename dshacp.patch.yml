@@ -1,0 +1,131 @@
+# DSHACP overlay patch: applied by `lib/bin.js` over the dsh-base bundle layer,
+# exactly the way `dsh-web-app/cordis.patch.yml` overlays it for the browser
+# surface. This file is the DSHACP-specific layer of the process composition:
+#
+#   dsh-base/cordis.patch.yml  (inserted by bin via boot() patches)
+#   dshacp.patch.yml          (this file, applied after)
+#   cordis.yml                (the leaf: DSHACP-owned rows only)
+#
+# The base layer already ships every model-facing tool, the sandbox/approval
+# stack, persistence, and the registries. The rows below (a) disable the
+# base's agent-plane tool rows so each session composes its agent from a
+# preset instead (the same disable list dsh-web-app uses — the base keeps
+# them for the single-session TUI, and disabling rather than deleting is
+# deliberate: a row absent from this overlay would silently reappear the day
+# someone reorders the base composition), and (b) restate the few rows whose
+# values DSHACP owns (headless: no HMR; the DSHACP persona; per-project
+# session persistence).
+
+# ── surface-specific values the base deliberately omits ─────────────────────
+
+# DSHACP is headless: stdout is reserved for ACP JSON-RPC, and no HMR exists.
+- id: hmr
+  disabled: true
+
+# The deployment persona. Presets shadow it per agent (the standard preset
+# carries its own), so this is the fallback for any session composed outside
+# a preset.
+- id: system-prompt
+  config:
+    persona: >-
+      You are a coding assistant powered by the {{model}} model. Your working directory is {{cwd}}. Your bash tool runs under a file sandbox — a `[sandbox: file access denied …]` result is policy, not a command bug.
+
+      Verify your work by running the code or tests. Keep answers brief and factual.
+
+# Sessions persist beside the project (Zed launches dshacp from the project
+# root, so `./.sessions` is per-project); DSH_SESSIONS_ROOT overrides. The
+# base default is the shared harness home, which would mix every project's
+# sessions into one list.
+- id: session-persistence-jsonl
+  config:
+    root: !!js "process.env.DSH_SESSIONS_ROOT ?? './.sessions'"
+
+# ── the agent plane moves behind agent presets ─────────────────────────────
+#
+# Every row below composes what ONE agent contributes to the host registries:
+# its tools and its prompt sections. The base keeps them for the TUI, which
+# is single-session and composes its agent process-wide; DSHACP disables them
+# here and lets each session mount a preset instead.
+#
+# Host-plane rows that MUST stay host-plane (per the base patch's own notes):
+# `shell-env`, the job/goal/subagent/workflow/tool REGISTRIES, `token-meter`,
+# `tool-subagent-report` (continuable setup is not scope-aware).
+
+- id: tool-bash
+  disabled: true
+
+- id: tool-pwsh
+  disabled: true
+
+- id: tool-jobs
+  disabled: true
+
+- id: tool-fs
+  disabled: true
+
+- id: tool-fs-search
+  disabled: true
+
+- id: tool-str-replace-editor
+  disabled: true
+
+# The `skill` REGISTRY stays in the host plane (layered per scope); presets
+# own local discovery and the model-facing catalog tool.
+- id: skill-filesystem
+  disabled: true
+
+- id: tool-skill
+  disabled: true
+
+# The goal SERVICE and its driver stay on the host plane; only the
+# model-facing tool moves behind presets.
+- id: tool-goal
+  disabled: true
+
+- id: plan-mode
+  disabled: true
+
+# The token METER stays on the host plane; the compaction backend that reads
+# it is per-session.
+- id: compaction-basic
+  disabled: true
+
+- id: command-compact
+  disabled: true
+
+- id: tool-result-pruner
+  disabled: true
+
+# The subagent registry and its backends stay on the host plane; presets
+# choose which delegation TOOLS their agent sees.
+- id: tool-subagent-control
+  disabled: true
+
+- id: tool-subagent-list-agents
+  disabled: true
+
+- id: tool-subagent
+  disabled: true
+
+- id: tool-subagent-fork
+  disabled: true
+
+# `tool-subagent-report` stays host-plane: it registers a CONTINUABLE SETUP
+# on the singleton registry, and that setup list is not scope-aware.
+- id: workflow-worker-thread
+  disabled: true
+
+- id: tool-workflow
+  disabled: true
+
+- id: tool-ralph
+  disabled: true
+
+- id: agent-instructions
+  disabled: true
+
+- id: tool-todo
+  disabled: true
+
+- id: tool-web
+  disabled: true
