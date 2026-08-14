@@ -12,7 +12,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { randomUUID } from 'node:crypto'
-import { isAbsolute } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import Schema from '@deepseek-ai/schemastery'
 import { createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
@@ -36,6 +36,7 @@ import {
   type NewSessionResponse,
   type PromptRequest,
   type PromptResponse,
+  type PlanEntryStatus,
   type ResumeSessionRequest,
   type ResumeSessionResponse,
   type SessionInfo,
@@ -44,11 +45,14 @@ import {
   type Stream,
   type ToolCallUpdate,
 } from '@agentclientprotocol/sdk'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentSetup } from '@deepseek-ai/dsh-agent'
+import { defineTool } from '@deepseek-ai/dsh-tools'
 import { SessionId, type Session, type SessionEvent, type TurnEndReason } from '@deepseek-ai/dsh-session'
 // Side-effect type imports: declaration-merge the event maps answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-session-title'
+import type {} from '@deepseek-ai/dsh-subagent'
+import type {} from '@deepseek-ai/dsh-workflow'
 import { type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval/types'
 import {
   acpPromptToText,
@@ -95,6 +99,14 @@ export interface BridgeConfig {
   model?: string
   /** How long a pushed permission request waits for the client before rejecting (fail-closed). */
   approvalTimeoutMs?: number
+  /**
+   * P3 hybrid mode: when true AND the client advertised
+   * `clientCapabilities.fs.writeTextFile`, the `write` tool is shadowed by a
+   * per-agent tool that delegates to the client's `fs/write_text_file`, so Zed
+   * applies the edit and offers per-hunk diff review. Everything else stays
+   * DSH-owned. Default false (opt-in).
+   */
+  hybridFileWrites?: boolean
   /** Runtime-only transport override; production uses stdio. */
   stream?: Stream
 }
@@ -103,6 +115,7 @@ export const Config: Schema<BridgeConfig> = Schema.object({
   provider: Schema.string(),
   model: Schema.string(),
   approvalTimeoutMs: Schema.natural().default(DEFAULT_APPROVAL_TIMEOUT_MS),
+  hybridFileWrites: Schema.boolean().default(false),
 })
 
 /** Per-session protocol state. */
@@ -123,6 +136,15 @@ interface SessionRecord {
   permission: {
     settle: (outcome: ApprovalOutcome) => void
     timer: ReturnType<typeof setTimeout>
+  } | undefined
+  /** Tool names the user granted `allow_always`; their calls skip the push. */
+  allowedTools: Set<string>
+  /** Live workflow run being rendered as plan updates (P2-1). */
+  workflow: {
+    runId: string
+    name: string
+    phase: string | undefined
+    agents: Map<number, { label: string; phase?: string; status: PlanEntryStatus }>
   } | undefined
   /** Cumulative token accounting for `usage_update` (session-wide). */
   usage: {
@@ -147,6 +169,8 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   const sessions = new Map<SessionId, SessionRecord>()
   const approvalTimeoutMs = config.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS
   let closed = false
+  /** Whether the client advertised `fs.writeTextFile` at initialize (P3 gate). */
+  let clientFsWrite = false
   let conn: AgentSideConnection
 
   /** Return the bridge-owned record for an agent, rejecting same-id impostors. */
@@ -351,15 +375,19 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     inflight.reject(internalError(`turn failed: ${errorChain(error)}`))
   })
 
-  // Permission requests are pushed to the client (DESIGN §7): hold the
+  // Permission requests are pushed to the client (DESIGN §7 + P2-3): hold the
   // synchronous waterfall, ask over ACP, backfill the outcome, and fail closed
-  // on timeout or disconnect. One-shot choices only; never infer a durable
-  // grant from an unknown client response.
+  // on timeout or disconnect. `allow_always` grants one call now and records
+  // the tool name in the session's allowlist so later calls of that tool skip
+  // the push entirely (per-session, per-tool semantics; the DSH approval
+  // policy itself stays `ask`). A grant is never inferred from an unknown
+  // client response.
   ctx.on('approval/request', (request, next) => {
     const record = ownedRecord(request.agent)
     const callId = request.callId
     if (record === undefined || callId === undefined) return next()
     if (closed) return Promise.resolve('rejected')
+    if (record.allowedTools.has(request.toolName)) return Promise.resolve('allowed-once')
     return new Promise<ApprovalOutcome>((resolve) => {
       const timer = setTimeout(() => resolve('rejected'), approvalTimeoutMs)
       timer.unref?.()
@@ -379,12 +407,16 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         toolCall,
         options: [
           { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+          { optionId: 'allow_always', name: 'Allow always', kind: 'allow_always' },
           { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' },
         ],
       }).then(({ outcome }) => {
         if (outcome.outcome === 'cancelled') settle('cancelled')
         else if (outcome.optionId === 'allow_once') settle('allowed-once')
-        else settle('rejected')
+        else if (outcome.optionId === 'allow_always') {
+          record.allowedTools.add(request.toolName)
+          settle('allowed-once')
+        } else settle('rejected')
       }).catch(() => settle('rejected'))
     })
   })
@@ -397,6 +429,185 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       logger.info('dshacp: additionalDirectories is accepted but not applied in P1')
     }
   }
+
+  /**
+   * P3 hybrid mode: when enabled AND the client advertised
+   * `clientCapabilities.fs.writeTextFile`, return an agent setup that shadows
+   * the global `write` tool with a per-agent tool delegating to the client's
+   * `fs/write_text_file`. Zed applies the edit to its buffers and offers
+   * per-hunk diff review; everything else stays DSH-owned. Relative paths
+   * resolve against the session cwd (the ACP wire requires absolute paths).
+   */
+  const hybridSetup = (sessionId: SessionId, cwd: string): AgentSetup | undefined => {
+    if (config.hybridFileWrites !== true || !clientFsWrite) return undefined
+    return (agentCtx) => {
+      agentCtx.tools.register(defineTool({
+        name: 'write',
+        description: 'Create or fully replace a UTF-8 text file. The file is written by the client editor (hybrid mode), so the change appears as a reviewable diff.',
+        parameters: {
+          file_path: {
+            type: 'string',
+            required: true,
+            description: 'Absolute path, or path relative to the working directory, to write.',
+          },
+          content: {
+            type: 'string',
+            required: true,
+            description: 'Full UTF-8 text content to write.',
+          },
+        },
+        output: {
+          schema: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              path: { type: 'string', required: true },
+              operation: { type: 'string', required: true },
+            },
+          },
+          render: (_args, value) => [{
+            type: 'text',
+            text: `The file ${value.path} has been written via the client editor (hybrid mode).`,
+          }],
+        },
+        async execute(args) {
+          const target = isAbsolute(args.file_path) ? args.file_path : join(cwd, args.file_path)
+          await conn!.writeTextFile({ sessionId, path: target, content: args.content })
+          return { path: target, operation: 'client-write' }
+        },
+      }))
+    }
+  }
+
+  /**
+   * Resolve the bridge session a delegated run (workflow/subagent) belongs to
+   * (P2-1). These events carry no agent identity, but a run only executes
+   * while the initiating agent's tool call is in flight — exactly one prompt
+   * is pending for that session, so the pending-turn record is the owner.
+   * Falls back to the initiator boundary when the event chain still carries it.
+   */
+  const turnOwner = (): SessionRecord | undefined => {
+    const initiator = agents.currentInitiator()
+    if (initiator !== undefined) {
+      const record = ownedRecord(initiator)
+      if (record !== undefined) return record
+    }
+    return [...sessions.values()].find(record => record.inflight !== undefined)
+  }
+
+  /** Send the workflow state as a whole-plan replacement (DESIGN P2-1). */
+  const emitWorkflowPlan = (record: SessionRecord): void => {
+    const workflow = record.workflow
+    if (workflow === undefined) return
+    const entries: { content: string; priority: 'medium'; status: PlanEntryStatus }[] = []
+    for (const agent of workflow.agents.values()) {
+      entries.push({
+        content: agent.phase !== undefined ? `${agent.label} (${agent.phase})` : agent.label,
+        priority: 'medium',
+        status: agent.status,
+      })
+    }
+    if (workflow.phase !== undefined) {
+      entries.push({ content: `phase: ${workflow.phase}`, priority: 'medium', status: 'in_progress' })
+    }
+    if (entries.length === 0) {
+      entries.push({ content: `workflow: ${workflow.name}`, priority: 'medium', status: 'in_progress' })
+    }
+    notify({
+      sessionId: sessionOf(record).id,
+      update: { sessionUpdate: 'plan', entries },
+    })
+  }
+
+  // Workflow runs render as plan updates: phases become progress groups and
+  // each `agent()` call becomes a task entry that flips to completed/failed
+  // when it settles (P2-1). The last update reports the run's stop reason.
+  ctx.on('workflow/start', (info) => {
+    const record = turnOwner()
+    if (record === undefined) return
+    record.workflow = {
+      runId: String(info.id),
+      name: info.meta.name,
+      phase: undefined,
+      agents: new Map(),
+    }
+    emitWorkflowPlan(record)
+  })
+
+  ctx.on('workflow/phase', (info, title) => {
+    const record = turnOwner()
+    if (record === undefined || record.workflow === undefined || record.workflow.runId !== String(info.id)) return
+    record.workflow.phase = title
+    emitWorkflowPlan(record)
+  })
+
+  ctx.on('workflow/agent-start', (info, agent) => {
+    const record = turnOwner()
+    if (record === undefined || record.workflow === undefined || record.workflow.runId !== String(info.id)) return
+    record.workflow.agents.set(agent.seq, { label: agent.label, phase: agent.phase, status: 'in_progress' })
+    emitWorkflowPlan(record)
+  })
+
+  ctx.on('workflow/agent-end', (info, agent) => {
+    const record = turnOwner()
+    if (record === undefined || record.workflow === undefined || record.workflow.runId !== String(info.id)) return
+    const entry = record.workflow.agents.get(agent.seq)
+    if (entry !== undefined) entry.status = agent.outcome === 'completed' ? 'completed' : 'in_progress'
+    emitWorkflowPlan(record)
+  })
+
+  ctx.on('workflow/end', (info, result) => {
+    const record = turnOwner()
+    if (record === undefined || record.workflow === undefined || record.workflow.runId !== String(info.id)) return
+    const summary = result.stopReason === 'completed' ? 'completed' : 'in_progress'
+    notify({
+      sessionId: sessionOf(record).id,
+      update: {
+        sessionUpdate: 'plan',
+        entries: [{
+          content: `workflow: ${record.workflow.name} (${result.stopReason})`,
+          priority: 'medium',
+          status: summary,
+        }],
+      },
+    })
+    record.workflow = undefined
+  })
+
+  // Subagent runs render as brief plan updates: the child appears as a task
+  // when it starts and flips to completed when it settles (P2-1). This shares
+  // the single plan slot with todo/workflow updates — the last writer wins.
+  ctx.on('subagent/start', (info) => {
+    const record = turnOwner()
+    if (record === undefined) return
+    notify({
+      sessionId: sessionOf(record).id,
+      update: {
+        sessionUpdate: 'plan',
+        entries: [{
+          content: `subagent: ${info.provider} (${info.id})`,
+          priority: 'medium',
+          status: 'in_progress',
+        }],
+      },
+    })
+  })
+
+  ctx.on('subagent/end', (info) => {
+    const record = turnOwner()
+    if (record === undefined) return
+    notify({
+      sessionId: sessionOf(record).id,
+      update: {
+        sessionUpdate: 'plan',
+        entries: [{
+          content: `subagent: ${info.provider} (${info.id})`,
+          priority: 'medium',
+          status: 'completed',
+        }],
+      },
+    })
+  })
 
   /** Build per-agent options from bridge config without assigning absent optional fields. */
   const agentOptions = (): { provider?: string; model?: string } =>
@@ -411,6 +622,8 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     dispose: () => handle.dispose(),
     inflight: undefined,
     permission: undefined,
+    allowedTools: new Set(),
+    workflow: undefined,
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
   })
 
@@ -425,6 +638,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     const handle = await agents.resume({
       resumeSessionId: sessionId,
       ...(Object.keys(agentOptions()).length > 0 ? { agentOptions: agentOptions() } : {}),
+      ...(hybridSetup(sessionId, cwd) !== undefined ? { setup: hybridSetup(sessionId, cwd) } : {}),
     })
     if (closed) {
       await handle.dispose()
@@ -521,7 +735,10 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   const makeAgent = (connection: AgentSideConnection): AcpAgent => {
     conn = connection
     return {
-      initialize(_params: InitializeRequest): Promise<InitializeResponse> {
+      initialize(params: InitializeRequest): Promise<InitializeResponse> {
+        // P3 gate: hybrid file writes are only offered when the client can
+        // apply them (Zed advertises fs.writeTextFile: true).
+        clientFsWrite = params.clientCapabilities?.fs?.writeTextFile === true
         // Single-version agent: the spec's "same version if supported, else
         // the latest supported" both resolve to this server's one version.
         return Promise.resolve({
@@ -551,6 +768,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
           sessionId,
           meta: { cwd: params.cwd },
           ...(Object.keys(agentOptions()).length > 0 ? { agentOptions: agentOptions() } : {}),
+          ...(hybridSetup(sessionId, params.cwd) !== undefined ? { setup: hybridSetup(sessionId, params.cwd) } : {}),
         })
         /* v8 ignore next 4 -- a real stdio close can race an in-flight create. */
         if (closed) {

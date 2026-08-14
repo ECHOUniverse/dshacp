@@ -49,6 +49,7 @@ import * as sessionCheckpointPolicy from '@deepseek-ai/dsh-session-checkpoint-po
 import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite'
 import * as bridge from './bridge.ts'
 import { pickDefined } from './options.ts'
+import { provideWebServerStub } from './webserver-stub.ts'
 
 export const name = 'dshacp'
 const DEFAULT_PERSISTENCE_ROOT = './.sessions'
@@ -117,6 +118,8 @@ export interface Config {
   invariants?: InvariantConfig
   /** How long a pushed permission request waits for the client before rejecting (fail-closed). */
   approvalTimeoutMs?: number
+  /** P3 hybrid mode: delegate `write` to the client's `fs/write_text_file` when it advertises the capability. */
+  hybridFileWrites?: boolean
 }
 
 /** The skill config schema exported for app packages that forward `skills`. */
@@ -163,6 +166,7 @@ export const Config: z<Config> = z.object({
   toolJobs: z.union([z.const(false), ToolJobsConfigSchema]),
   invariants: InvariantRegistry.Config,
   approvalTimeoutMs: z.natural(),
+  hybridFileWrites: z.boolean().default(false),
 })
 
 /**
@@ -170,7 +174,7 @@ export const Config: z<Config> = z.object({
  * settings. Absent optional fields stay absent so owner schemas apply defaults;
  * `workspaceContext` is required and always forwarded.
  */
-function pickSpineConfig(config: Config): Omit<Config, 'provider' | 'model' | 'persistenceRoot' | 'packChunks' | 'persistenceCompression' | 'approvalTimeoutMs'> {
+function pickSpineConfig(config: Config): Omit<Config, 'provider' | 'model' | 'persistenceRoot' | 'packChunks' | 'persistenceCompression' | 'approvalTimeoutMs' | 'hybridFileWrites'> {
   return {
     ...pickDefined(config, [
       'maxParallelToolCalls',
@@ -213,6 +217,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       }
     },
   })
+  // P2-2: the ssh plugin hard-injects `webServer`; this process serves no HTTP,
+  // so publish the no-op stub before any injector row resolves.
+  provideWebServerStub(ctx)
   await ctx.effect(async function* () {
     const spine = ctx.plugin(spineComposition, spineConfig)
     await spine
@@ -229,7 +236,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const query = ctx.plugin(SqliteSessionQueryEngine, { path: join(persistenceRoot, 'session-query.db') })
     await query
     yield query.dispose
-    const transport = ctx.plugin(bridge, pickDefined(config, ['provider', 'model', 'approvalTimeoutMs']))
+    const transport = ctx.plugin(bridge, pickDefined(config, ['provider', 'model', 'approvalTimeoutMs', 'hybridFileWrites']))
     await transport
     yield transport.dispose
   }, 'dshacp.composition')

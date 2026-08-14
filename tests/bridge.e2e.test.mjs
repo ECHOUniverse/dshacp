@@ -2,7 +2,7 @@
 // stdio). Prompt tests need a real model credential and skip without one.
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { rm } from 'node:fs/promises'
+import { readFile, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { PROJECT_ROOT, hasModelCredential, spawnBridge, waitFor } from './harness.mjs'
@@ -35,6 +35,8 @@ after(async () => {
   await bridge?.stop()
   await rm(SESSIONS, { recursive: true, force: true })
   await rm(join(homedir(), 'dshacp-approval-probe'), { force: true })
+  await rm(join(homedir(), 'dshacp-allow-always-1'), { force: true })
+  await rm(join(homedir(), 'dshacp-allow-always-2'), { force: true })
 })
 
 test('initialize negotiates the DESIGN §5 surface', async () => {
@@ -212,6 +214,102 @@ test('todo/write maps to plan updates with fixed medium priority', { skip: !PROM
   await bridge.client.closeSession({ sessionId: created.sessionId })
 })
 
+test('workflow runs render as plan updates (P2-1)', { skip: !PROMPT_AVAILABLE }, async () => {
+  const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+  const start = bridge.updates.length
+  const result = await bridge.client.prompt({
+    sessionId: created.sessionId,
+    prompt: [{ type: 'text', text: 'Use the workflow tool to run exactly this script and report its result: meta name "wf-test", description "t". Body: phase("setup"); log("hello"); return "ok".' }],
+  })
+  assert.ok(['end_turn', 'max_tokens'].includes(result.stopReason), `prompt settled: ${result.stopReason}`)
+  const plans = bridge.updates.slice(start).filter(update =>
+    update.kind === 'session_update' && update.tag === 'plan')
+  assert.ok(plans.length >= 2, 'workflow start + end produce plan updates')
+  assert.ok(plans.some(plan => plan.update.entries.some(entry => entry.content.includes('wf-test'))),
+    'plan announces the workflow by name')
+  assert.ok(plans.some(plan => plan.update.entries.some(entry => entry.content.includes('setup'))),
+    'workflow phases appear in the plan')
+  const finalPlan = plans[plans.length - 1].update.entries
+  assert.ok(finalPlan.every(entry => entry.priority === 'medium'), 'plan entries carry medium priority')
+  await bridge.client.closeSession({ sessionId: created.sessionId })
+})
+
+test('allow_always grants once and skips later pushes for the same tool (P2-3)', { skip: !PROMPT_AVAILABLE }, async () => {
+  const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+  bridge.answerPermission({ outcome: 'selected', optionId: 'allow_always' })
+  const first = await bridge.client.prompt({
+    sessionId: created.sessionId,
+    prompt: [{ type: 'text', text: 'Run: touch ~/dshacp-allow-always-1. If you hit a sandbox denial, retry the exact same command once with sandbox_permissions and a one-sentence justification, then confirm it worked.' }],
+  })
+  assert.ok(['end_turn', 'max_tokens'].includes(first.stopReason), `first prompt settled: ${first.stopReason}`)
+  const firstPermission = await waitFor(() => bridge.updates.find(update =>
+    update.kind === 'request_permission' && update.params.sessionId === created.sessionId))
+  assert.ok(firstPermission.params.options.some(option => option.optionId === 'allow_always' && option.kind === 'allow_always'),
+    'permission offers allow_always')
+
+  // Second escalation of the same tool must not push a permission again.
+  const before = bridge.updates.filter(update => update.kind === 'request_permission').length
+  const second = await bridge.client.prompt({
+    sessionId: created.sessionId,
+    prompt: [{ type: 'text', text: 'Run: touch ~/dshacp-allow-always-2. If you hit a sandbox denial, retry the exact same command once with sandbox_permissions and a one-sentence justification, then confirm it worked.' }],
+  })
+  assert.ok(['end_turn', 'max_tokens'].includes(second.stopReason), `second prompt settled: ${second.stopReason}`)
+  const after = bridge.updates.filter(update => update.kind === 'request_permission').length
+  assert.equal(after, before, 'no second permission push for the allowed tool')
+  await bridge.client.closeSession({ sessionId: created.sessionId })
+})
+
+test('P3 hybrid: write delegates to the client when it advertises fs.writeTextFile', { skip: !PROMPT_AVAILABLE }, async () => {
+  const target = join(PROJECT_ROOT, '.hybrid-test-file.txt')
+  await rm(target, { force: true })
+  const hybrid = spawnBridge({
+    env: { DSHACP_HYBRID: '1' },
+    handlers: {
+      writeTextFile: async (params) => {
+        await writeFile(params.path, params.content, 'utf8')
+      },
+    },
+  })
+  try {
+    await waitFor(async () => {
+      try {
+        await hybrid.client.initialize({
+          protocolVersion: 1,
+          clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+          clientInfo: { name: 'dshacp-hybrid-test', version: '0.0.1' },
+        })
+        return true
+      } catch {
+        return false
+      }
+    }, 60000)
+    const created = await hybrid.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+    const result = await hybrid.client.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: `Use the write tool to create the file .hybrid-test-file.txt with exactly this content: hybrid hello` }],
+    })
+    assert.ok(['end_turn', 'max_tokens'].includes(result.stopReason), `prompt settled: ${result.stopReason}`)
+    // The client must have received an fs/write_text_file request (hybrid), and
+    // the harness-side handler applied it to disk.
+    const request = await waitFor(() => hybrid.updates.find(update => update.kind === 'write_text_file'))
+    assert.ok(request.params.path.endsWith('.hybrid-test-file.txt'), `path delegated: ${request.params.path}`)
+    assert.match(request.params.content, /hybrid hello/, 'content delegated verbatim')
+    await waitFor(async () => {
+      try {
+        return (await readFile(target, 'utf8')).includes('hybrid hello') ? true : undefined
+      } catch {
+        return undefined
+      }
+    }, 10000)
+    const onDisk = await readFile(target, 'utf8')
+    assert.ok(onDisk.includes('hybrid hello'), 'file written by the client handler')
+    await hybrid.client.closeSession({ sessionId: created.sessionId })
+  } finally {
+    await hybrid.stop()
+    await rm(target, { force: true })
+  }
+})
+
 test('approval bridge: a bash escalation surfaces as request_permission and allow-once grants it', { skip: !PROMPT_AVAILABLE }, async () => {
   const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
   // Home-directory write → sandbox denial → model escalates with
@@ -227,8 +325,8 @@ test('approval bridge: a bash escalation surfaces as request_permission and allo
   assert.ok(permission.params.toolCall.toolCallId, 'permission request carries the tool call id')
   assert.deepEqual(
     permission.params.options.map(option => option.kind),
-    ['allow_once', 'reject_once'],
-    'permission offers allow_once + reject_once only',
+    ['allow_once', 'allow_always', 'reject_once'],
+    'permission offers allow_once + allow_always + reject_once',
   )
   // The tool must have completed (not failed) after the grant.
   const toolId = permission.params.toolCall.toolCallId

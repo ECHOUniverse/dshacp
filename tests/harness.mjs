@@ -9,11 +9,10 @@ export const PROJECT_ROOT = fileURLToPath(new URL('..', import.meta.url))
 
 /**
  * Spawn the DSHACP bin with a sandboxed persistence root.
- * @param options - env overrides and cwd for the child.
- * @returns child, client, and a collector of session updates.
+ * @param options - env overrides, child cwd, and client-handler overrides.
  */
 export function spawnBridge(options = {}) {
-  const { env = {}, cwd = PROJECT_ROOT } = options
+  const { env = {}, cwd = PROJECT_ROOT, handlers = {} } = options
   const sessionsDir = env.DSH_SESSIONS_ROOT ?? `${PROJECT_ROOT}/.test-sessions`
   const child = spawn('node', ['lib/bin.js'], {
     cwd,
@@ -34,8 +33,14 @@ export function spawnBridge(options = {}) {
         ? pendingPermissions.shift()
         : { outcome: 'cancelled' }
     },
-    readTextFile: async () => ({ content: '' }),
-    writeTextFile: async () => null,
+    readTextFile: async (params) => {
+      updates.push({ kind: 'read_text_file', params })
+      return handlers.readTextFile ? handlers.readTextFile(params) : { content: '' }
+    },
+    writeTextFile: async (params) => {
+      updates.push({ kind: 'write_text_file', params })
+      return handlers.writeTextFile ? handlers.writeTextFile(params) : null
+    },
     sessionUpdate: async (params) => {
       const tag = params.update.sessionUpdate
       updates.push({ kind: 'session_update', tag, update: params.update })

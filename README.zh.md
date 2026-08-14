@@ -11,10 +11,16 @@ Zed（agent 面板，ACP v1 stdio 客户端）→ **dshacp**（独立 agent spin
 - 工具调用与结果（`tool_call` / `tool_call_update`，含 ACP `kind` 映射）
 - 由 `todo_write` 生成的计划更新（`plan`）与累计用量（`usage_update`）
 - 审批推送到客户端（`session/request_permission`，含 `allow_once` /
-  `reject_once`；超时或断连时 fail-closed 拒绝）
+  `allow_always` / `reject_once`；超时或断连时 fail-closed 拒绝；
+  `allow_always` 会在会话内记住该工具）
 - 完整的会话管理：`session/new`、`session/load`（恢复 + 全量历史回放）、
   `session/resume`、`session/list`（标题来自 DSH 会话标题服务）、
   `session/delete`、`session/close`、`session/cancel`
+- 委托运行的结构化可见性：workflow 与 subagent 运行以 `plan` 更新呈现
+- 远程 SSH 运维（ssh_list / ssh_exec / ssh_upload / ssh_download /
+  ssh_tunnel / ssh_cluster），复用 `~/.dsh/dsh-ssh.json`
+- 可选混合模式（`DSHACP_HYBRID=1`）：当客户端声明支持时，`write` 工具委托给
+  Zed 的 `fs/write_text_file`，文件编辑以逐块可审查的 diff 呈现
 
 设计与实现计划：[`docs/DESIGN.md`](docs/DESIGN.md)。
 研究事实清单：[`ACP-fact-sheet.md`](ACP-fact-sheet.md)、
@@ -66,6 +72,7 @@ Zed 以 `cwd` = 项目根目录启动 `dshacp`，通过 stdio 使用换行分隔
 | `DSH_SESSIONS_ROOT` | 会话持久化目录（默认 `./.sessions`） |
 | `DSH_PERMISSION_MODE` | `workspace-write`（默认）或 `danger-full-access`（审批策略变为 `never`） |
 | `DEEPSEEK_API_KEY` | `~/.dsh/.credentials.yaml` 缺失时的 API 密钥 |
+| `DSHACP_HYBRID` | `1` 开启 P3 混合模式：当客户端声明 `fs/write_text_file` 时，`write` 委托给客户端（Zed diff 审查） |
 
 ## ACP 能力面
 

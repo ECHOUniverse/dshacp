@@ -59,6 +59,10 @@
     provider: deepseek-official
     model: deepseek-v4-flash
     persistenceRoot: !!js "process.env.DSH_SESSIONS_ROOT ?? './.sessions'"
+    # P3 hybrid mode (opt-in): with DSHACP_HYBRID=1 AND a client that
+    # advertises fs.writeTextFile (Zed does), the `write` tool delegates to the
+    # client editor so Zed offers per-hunk diff review.
+    hybridFileWrites: !!js "process.env.DSHACP_HYBRID === '1'"
     workspaceContext:
       maxBytes: 65536
     # Keep the persona to identity and behavior; tool plugins own tool guidance.
@@ -169,3 +173,13 @@
 
 - id: tool-fs
   name: '@deepseek-ai/dsh-tool-fs'
+
+# P2-2: remote SSH operations (engine + model tools + prompt announcement).
+# The app provides a no-op `webServer` stub because this process serves no
+# HTTP; host management and the web terminal stay in the DSH web app. Hosts
+# are configured by the user in ~/.dsh/dsh-ssh.json (shared with the web app).
+- id: ssh
+  name: '@linxin666/dsh-ssh'
+  config:
+    announceToAgent: true
+    enabled: true

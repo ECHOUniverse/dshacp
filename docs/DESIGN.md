@@ -211,17 +211,37 @@ DSH's `approval/request` is a **synchronous waterfall**; ACP's `session/request_
 - **Message ids**: `msg-<turn>-<step>` for assistant streams, `thought-<turn>-<step>` for
   reasoning, `usr-<seq>` for replayed user prompts.
 
-### Phase 2 (P2)
-- Structured exposure of `subagent` / `goal` / `workflow` as updates (e.g. map goal state or
-  workflow phases onto `plan`/`session_info_update` or custom `_`-methods).
-- First-class ACP surface for the `ssh` plugin (ssh_exec etc. as tool calls — likely already works
-  via the generic tool path; formalize kind/args rendering).
-- Evaluate `allow_always` (map to per-session approval-policy change semantics).
+### Phase 2 (P2) ✅ (implemented; e2e-tested against a real model)
+- [x] **Structured exposure of `subagent` / `workflow` as updates**: workflow runs render as
+  `plan` updates — `workflow/start` announces the run, `workflow/phase` becomes a progress
+  group, each `agent()` call becomes a task entry that flips to completed when it settles,
+  and `workflow/end` reports the stop reason. Subagent runs render as brief start/completed
+  plan entries. Run→session correlation uses the pending-turn owner (a run only executes
+  while its initiating agent's prompt is in flight), with the initiator boundary as a
+  fallback. `goal` is **not** exposed: the composition mounts no goal domain (P1 spine
+  skips it), so there is no goal state to map — revisit if goals are enabled.
+- [x] **First-class ACP surface for the `ssh` plugin**: `@linxin666/dsh-ssh` is mounted in
+  `cordis.yml`; the app provides a no-op `webServer` stub (this process serves no HTTP, so
+  the plugin's route/upgrade registrations are discarded) while the SSH engine, model tools
+  (`ssh_list`/`ssh_exec`/`ssh_upload`/`ssh_download`/`ssh_tunnel`/`ssh_cluster`), and prompt
+  announcement work normally. Host config stays in `~/.dsh/dsh-ssh.json`, shared with the
+  web app. Tool `kind` mapping already routes `ssh_*` → `execute` (verified: `ssh_list`
+  renders as an `execute` tool-call card).
+- [x] **`allow_always` evaluated and implemented**: maps to per-session, per-tool semantics.
+  Choosing `allow_always` grants the current call and records the tool name in the session's
+  allowlist; later calls of that tool resolve `approval/request` to `allowed-once` without a
+  push. The DSH approval policy itself stays `ask` — the allowlist lives in the bridge,
+  scoped to one ACP session, and is not a durable grant.
 
-### Phase 3 (P3)
-- Hybrid mode: optionally delegate **file write** to Zed via `fs/write_text_file`
-  (gated on `clientCapabilities.fs.writeTextFile`) to get per-hunk diff review; everything else
-  stays DSH-owned. Add opt-in config.
+### Phase 3 (P3) ✅ (implemented, opt-in; e2e-tested)
+- [x] **Hybrid mode**: opt-in via `hybridFileWrites` (env `DSHACP_HYBRID=1` in the shipped
+  composition). Gated on `clientCapabilities.fs.writeTextFile` at `initialize`. When active,
+  the agent's `write` tool is shadowed by a per-agent scoped tool (DSH's scoped
+  registrations shadow globals) that delegates to `fs/write_text_file` — Zed applies the
+  edit to its buffers and offers per-hunk diff review. Everything else stays DSH-owned.
+  Relative paths resolve against the session cwd (the ACP wire requires absolute paths).
+  `edit` stays local (delegation would require read+transform+full rewrite; revisit if Zed's
+  diff UX demands it).
 
 ## 10. Defaults & open tunables (pick during implementation)
 

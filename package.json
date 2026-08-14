@@ -82,7 +82,8 @@
     "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-user-approval": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-workflow-worker-thread": "^0.1.0-rc.6",
-    "@deepseek-ai/schemastery": "^3.18.1"
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "@linxin666/dsh-ssh": "^0.1.10"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

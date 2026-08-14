@@ -14,10 +14,18 @@ DSH's full core loop so Zed is a first-class front-end for DSH:
   mapping)
 - plan updates from `todo_write` and cumulative `usage_update`
 - approval pushed to the client (`session/request_permission` with
-  `allow_once` / `reject_once`, fail-closed on timeout or disconnect)
+  `allow_once` / `allow_always` / `reject_once`, fail-closed on timeout or
+  disconnect; `allow_always` remembers the tool for the session)
 - full session management: `session/new`, `session/load` (resume + full
   history replay), `session/resume`, `session/list` (titles from the DSH
   session-title service), `session/delete`, `session/close`, `session/cancel`
+- structured delegation visibility: workflow runs and subagent runs render as
+  `plan` updates
+- remote SSH operations (ssh_list / ssh_exec / ssh_upload / ssh_download /
+  ssh_tunnel / ssh_cluster) via the dsh-ssh plugin, sharing `~/.dsh/dsh-ssh.json`
+- opt-in hybrid mode (`DSHACP_HYBRID=1`): the `write` tool delegates to Zed's
+  `fs/write_text_file` when the client advertises it, so file edits appear as
+  per-hunk reviewable diffs
 
 Design and implementation plan: [`docs/DESIGN.md`](docs/DESIGN.md).
 Research fact sheets: [`ACP-fact-sheet.md`](ACP-fact-sheet.md),
@@ -71,6 +79,7 @@ custom agents.
 | `DSH_SESSIONS_ROOT` | Session persistence directory (default `./.sessions`) |
 | `DSH_PERMISSION_MODE` | `workspace-write` (default) or `danger-full-access` (approval policy becomes `never`) |
 | `DEEPSEEK_API_KEY` | API key when not in `~/.dsh/.credentials.yaml` |
+| `DSHACP_HYBRID` | `1` enables P3 hybrid mode: `write` delegates to the client's `fs/write_text_file` (Zed diff review) when the client advertises the capability |
 
 ## ACP surface
 
