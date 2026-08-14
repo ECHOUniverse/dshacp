@@ -200,14 +200,26 @@ function pickSpineConfig(config: Config): Omit<Config, 'provider' | 'model' | 'p
 export async function apply(ctx: Context, config: Config): Promise<void> {
   const persistenceRoot = config.persistenceRoot ?? DEFAULT_PERSISTENCE_ROOT
   const spineConfig = pickSpineConfig(config)
+  // Route every structured log record to stderr: stdout is reserved for ACP
+  // JSON-RPC. Cordis's default exporter only buffers, so without this the
+  // bridge's diagnostics would be silently dropped.
+  ctx.logger.exporter({
+    colors: 3,
+    export: (message) => {
+      try {
+        process.stderr.write(`[${message.name}] ${message.type}: ${message.args.map(String).join(' ')}\n`)
+      } catch {
+        // A logging failure must never corrupt the JSON-RPC stream.
+      }
+    },
+  })
   await ctx.effect(async function* () {
     const spine = ctx.plugin(spineComposition, spineConfig)
     await spine
     yield spine.dispose
     const persistence = ctx.plugin(JsonlSessionPersistence, {
       root: persistenceRoot,
-      ...config.packChunks !== undefined ? { packChunks: config.packChunks } : {},
-      ...(config.persistenceCompression === undefined ? {} : { compression: config.persistenceCompression }),
+      ...pickDefined(config, ['packChunks', 'persistenceCompression']),
     })
     await persistence
     yield persistence.dispose
@@ -217,11 +229,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     const query = ctx.plugin(SqliteSessionQueryEngine, { path: join(persistenceRoot, 'session-query.db') })
     await query
     yield query.dispose
-    const transport = ctx.plugin(bridge, {
-      ...config.provider !== undefined ? { provider: config.provider } : {},
-      ...config.model !== undefined ? { model: config.model } : {},
-      ...config.approvalTimeoutMs !== undefined ? { approvalTimeoutMs: config.approvalTimeoutMs } : {},
-    })
+    const transport = ctx.plugin(bridge, pickDefined(config, ['provider', 'model', 'approvalTimeoutMs']))
     await transport
     yield transport.dispose
   }, 'dshacp.composition')

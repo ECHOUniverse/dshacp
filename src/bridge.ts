@@ -201,9 +201,9 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     // "Tokens currently in context": input + output + cache + thought tokens.
     const used = record.usage.input + record.usage.output + record.usage.cacheRead + record.usage.cacheWrite + record.usage.reasoning
     if (used <= 0) return
-    const size = record.agent.session.requestContext()?.contextWindow ?? 0
+    const size = sessionOf(record).requestContext()?.contextWindow ?? 0
     notify({
-      sessionId: record.agent.session.id,
+      sessionId: sessionOf(record).id,
       update: { sessionUpdate: 'usage_update', used, size },
     })
   }
@@ -217,7 +217,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
    * are replayed — injected context stays off the wire.
    */
   const emitForEvent = (record: SessionRecord, event: SessionEvent, replay = false): void => {
-    const sessionId = record.agent.session.id
+    const sessionId = sessionOf(record).id
     switch (event.type) {
       case 'user/message': {
         if (!replay || event.data.source.kind !== 'user') return
@@ -314,7 +314,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
 
   ctx.on('session/event', (session, event: SessionEvent) => {
     const record = sessions.get(session.header.id)
-    if (record === undefined || record.agent.session !== session) return
+    if (record === undefined || sessionOf(record) !== session) return
     try {
       emitForEvent(record, event)
     } finally {
@@ -375,7 +375,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         status: 'pending',
       }
       void conn.requestPermission({
-        sessionId: record.agent.session.id,
+        sessionId: sessionOf(record).id,
         toolCall,
         options: [
           { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
@@ -402,6 +402,22 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   const agentOptions = (): { provider?: string; model?: string } =>
     pickDefined(config, ['provider', 'model'])
 
+  /** The live session behind a bridge record (shortens the common navigation). */
+  const sessionOf = (record: SessionRecord): Session => record.agent.session
+
+  /** Wrap an owned agent handle in the bridge's per-session protocol state. */
+  const makeRecord = (handle: { agent: Agent; dispose: () => Promise<void> }): SessionRecord => ({
+    agent: handle.agent,
+    dispose: () => handle.dispose(),
+    inflight: undefined,
+    permission: undefined,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+  })
+
+  /** ISO timestamp of the log's last event, or null for an empty log. */
+  const lastUpdated = (events: readonly { time: number }[]): string | null =>
+    events.length > 0 ? new Date(events[events.length - 1]!.time).toISOString() : null
+
   /** Resume a persisted session into the bridge, rejecting when already open. */
   const resumeRecord = async (sessionId: SessionId, cwd: string): Promise<SessionRecord> => {
     assertOpen()
@@ -414,20 +430,14 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       await handle.dispose()
       throw internalError('connection closed during session/resume')
     }
-    const record: SessionRecord = {
-      agent: handle.agent,
-      dispose: () => handle.dispose(),
-      inflight: undefined,
-      permission: undefined,
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
-    }
+    const record = makeRecord(handle)
     sessions.set(sessionId, record)
     return record
   }
 
   /** Replay a session's full durable log as wire notifications (session/load). */
   const replaySession = (record: SessionRecord): void => {
-    const events = record.agent.session.events
+    const events = sessionOf(record).events
     for (const event of events) emitForEvent(record, event, true)
   }
 
@@ -441,14 +451,14 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     const infos: SessionInfo[] = []
     const seen = new Set<SessionId>()
     for (const record of sessions.values()) {
-      const session = record.agent.session
+      const session = sessionOf(record)
       const events = session.events
       seen.add(session.id)
       infos.push({
         sessionId: session.id,
         cwd: session.header.cwd ?? '',
         title: sessionTitle(session) ?? null,
-        updatedAt: events.length > 0 ? new Date(events[events.length - 1]!.time).toISOString() : null,
+        updatedAt: lastUpdated(events),
       })
     }
     const persistence = ctx.get('sessionPersistence')
@@ -468,8 +478,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
           const preparation = await persistence.prepare(header.id)
           const session = preparation.session
           title = sessionTitle(session) ?? null
-          const events = session.events
-          updatedAt = events.length > 0 ? new Date(events[events.length - 1]!.time).toISOString() : null
+          updatedAt = lastUpdated(session.events)
           preparation[Symbol.dispose]()
         } catch (error: unknown) {
           logger.warn(`dshacp: preparing persisted session ${header.id} failed: ${String(error)}`)
@@ -548,13 +557,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
           await handle.dispose()
           throw internalError('connection closed during session/new')
         }
-        sessions.set(sessionId, {
-          agent: handle.agent,
-          dispose: () => handle.dispose(),
-          inflight: undefined,
-          permission: undefined,
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
-        })
+        sessions.set(sessionId, makeRecord(handle))
         return { sessionId }
       },
 
@@ -588,7 +591,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
           sessions.delete(sessionId)
           // Flush the durable log before disposal so no buffered events are lost,
           // then unlink the artifact below.
-          await ctx.sessions.flush(record.agent.session)
+          await ctx.sessions.flush(sessionOf(record))
           await record.dispose()
         }
         await deletePersisted(sessionId)
@@ -598,11 +601,11 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         const record = requireSession(SessionId(params.sessionId))
         settlePermission(record, 'cancelled')
         settlePrompt(record, 'cancelled')
-        sessions.delete(record.agent.session.id)
+        sessions.delete(sessionOf(record).id)
         record.agent.cancel({ kind: 'user' })
         // Flush the durable log before disposal so a later session/list (which
         // reads storage) and a later load/resume see the complete history.
-        await ctx.sessions.flush(record.agent.session)
+        await ctx.sessions.flush(sessionOf(record))
         await record.dispose()
       },
 

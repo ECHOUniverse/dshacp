@@ -76,8 +76,7 @@ export function promptHasUnsupportedContent(prompt: readonly AcpContentBlock[]):
  *
  * The mapping is deliberately rule-based over exact-name matching so plugin
  * tools (ssh stack, future tools) degrade to sensible kinds without a code
- * change. Names are matched on the last path segment after `_`? No — DSH tool
- * names are plain kebab/snake identifiers; prefix families are matched below.
+ * change; prefix families are matched below.
  *
  * @param name - the DSH tool name as the model called it.
  * @returns the closest ACP `ToolKind`.

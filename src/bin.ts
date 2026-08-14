@@ -35,9 +35,10 @@ const { values } = parseArgs({
   strict: true,
 })
 const ctx = await boot(NAME, resolveConfigPath(values.config ?? SHIPPED_CONFIG, snapshotMode))
-if (snapshotMode !== undefined) {
-  process.stdin.on('end', () => {
-    void ctx.fiber.dispose().then(() => { process.exit(0) })
-  })
-}
+// EOF closes the ACP connection; dispose the tree (flush persistence, drain
+// agents) and exit cleanly. The calling client (Zed) also owns process
+// lifetime and may kill us outright — this is the graceful path.
+process.stdin.on('end', () => {
+  void ctx.fiber.dispose().then(() => { process.exit(0) })
+})
 /* v8 ignore stop */
