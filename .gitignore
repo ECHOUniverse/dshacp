@@ -1,0 +1,8 @@
+node_modules/
+lib/
+.sessions/
+.test-sessions/
+.debug-sessions/
+*.log
+.env
+.DS_Store
