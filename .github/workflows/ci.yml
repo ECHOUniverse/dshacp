@@ -1,0 +1,24 @@
+# CI: typecheck + unit tests + e2e protocol tests on every push/PR.
+# E2E prompt tests self-skip without a model credential (they check the
+# harness home), so this workflow runs green on public CI without secrets.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      # Tests drive the built bin (lib/ is gitignored), so build first.
+      - run: npm run build
+      - run: npm test

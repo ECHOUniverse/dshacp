@@ -9,3 +9,9 @@ lib/
 .test-home/
 .test-home-*/
 .test-sessions-*/
+# secrets / credentials (defense in depth: never commit key material)
+*.credentials.yaml
+*.pem
+*.key
+id_rsa*
+id_ed25519*
