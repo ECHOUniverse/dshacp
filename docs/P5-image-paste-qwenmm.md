@@ -194,6 +194,15 @@ if (text.trim().length === 0) throw invalidParams('empty prompt')
 3. **qwenmm tag pin**：当前 pin `v1.0.3`；升级时只改 `cordis.yml` 的 tag，并同步升级 Skill 目录。
 4. **多图顺序**：所有图片标记按 wire 顺序追加在用户文本之后（Q6 约定），不与正文交错。
 
+### 4.1 真机验证记录（2026-08-15，Zed + mac 截图）
+
+- **项 1 通过**：Zed 实际发送 `image/png`（1568×544 mac 截图），白名单放行，tmp 落盘与标记注入均正常。
+- **项 2 出现重要偏差——已修复，待复测**：
+  - 真机观察：模型**优先调用 `read_image` 而非 qwenmm**。原因是本机 `~/.dsh/settings.yaml` 给 `llm-pi-ai.providers.opencode-go` 的 `modelOverrides` 声明了 `input: [text, image]`，使 `read_image` 的 `assertImageCapableRoute` 闸门放行（P5 §1.2 的"所有路由纯文本"前提在该路由上不成立）。
+  - 后果：`read_image` 返回 DSH 原生 image block（attachment 引用）进入消息历史，`dsh-llm-pi-ai` 将其序列化为 `image_url` 变体，而 **Console Go 上游 schema 只接受 `text`** → `400 invalid_request_error: unknown variant 'image_url', expected 'text'`（`Internal error: turn failed: 400 …`）。
+  - 修复：`~/.dsh/settings.yaml` 中 opencode-go 两个模型的 `input` 改回 `[text]`（上游本就不支持 image，声明是假能力；`dsh-llm-pi-ai` 行 827 还会在序列化前抛 `UNSUPPORTED_CONTENT` 兜底）。**待复测**：read_image 被闸门拦截后，模型是否转向 qwenmm `vision_chat`——若仍不转向，落地 Q6-C 强指令。
+  - 已污染会话（历史含 image block）必须删除（本机为项目 `.sessions` 下的对应目录），任何路由都无法继续使用该历史。
+
 ---
 
 ## 5. 测试计划
