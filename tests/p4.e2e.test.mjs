@@ -230,7 +230,7 @@ test('model/thinking switches are remembered as the default for fresh sessions',
   }
 })
 
-test('mode switches only a blank session; a started session soft-rejects (D9)', async () => {
+test('mode switches a blank session (D9)', async () => {
   // Blank session: recompose to minimal.
   const blank = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
   const switched = await bridge.client.setSessionConfigOption({
@@ -240,7 +240,9 @@ test('mode switches only a blank session; a started session soft-rejects (D9)', 
   })
   assert.equal(switched.configOptions.find(option => option.id === 'mode').currentValue, 'minimal')
   await bridge.client.closeSession({ sessionId: blank.sessionId })
+})
 
+test('a started session soft-rejects a mode switch (D9)', { skip: !PROMPT_AVAILABLE }, async () => {
   // Started session: soft-reject — unchanged value, no exception.
   const started = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
   await bridge.client.prompt({
