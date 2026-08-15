@@ -301,6 +301,34 @@ test('workflow runs render as plan updates (P2-1)', { skip: !PROMPT_AVAILABLE },
   await bridge.client.closeSession({ sessionId: created.sessionId })
 })
 
+test('a spawned subagent completes and its plan entry settles clean (subagent fix)', { skip: !PROMPT_AVAILABLE }, async () => {
+  // Regression for the subagent failure (docs/subagent-failure-fix.md): the
+  // child assembles its system prompt from the parent's AgentOptions, so an
+  // absent model made every child's first turn fail with
+  // `{{model}} has no value`. A failed child settles with stopReason `error`,
+  // which the bridge annotates on the plan entry as `subagent: spawn (id)
+  // (error)`; a healthy child settles clean.
+  const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+  const start = bridge.updates.length
+  const result = await bridge.client.prompt({
+    sessionId: created.sessionId,
+    prompt: [{ type: 'text', text: 'Call the subagent tool exactly once with run_in_background: false, description "regression-test", prompt "Reply with exactly: ok". Wait for it and report the result.' }],
+  })
+  assert.ok(['end_turn', 'max_tokens'].includes(result.stopReason), `prompt settled: ${result.stopReason}`)
+  // Foreground waits for the child, so its settlement is observable as the
+  // completed subagent/end plan entry (no failure annotation).
+  const end = await waitFor(() => bridge.updates.slice(start).find(update =>
+    update.kind === 'session_update' && update.tag === 'plan'
+    && update.update.entries.some(entry =>
+      entry.status === 'completed' && /^subagent: spawn \([0-9a-f-]+\)$/.test(entry.content))), 120000)
+  assert.ok(end, 'subagent/end settles the child as completed with no failure annotation')
+  const annotated = bridge.updates.slice(start).filter(update =>
+    update.kind === 'session_update' && update.tag === 'plan'
+    && update.update.entries.some(entry => /\(error\)$/.test(entry.content)))
+  assert.equal(annotated.length, 0, 'no plan entry annotates a failed subagent run')
+  await bridge.client.closeSession({ sessionId: created.sessionId })
+})
+
 test('allow_always grants once and skips later pushes for the same tool (P2-3)', { skip: !PROMPT_AVAILABLE }, async () => {
   const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
   bridge.answerPermission({ outcome: 'selected', optionId: 'allow_always' })

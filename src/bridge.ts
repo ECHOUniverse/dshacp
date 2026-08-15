@@ -331,8 +331,15 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     const selected = selectionFor(record).current
     if (selected === undefined) return
     const options = record.agent.options as { provider?: string; model?: string }
-    options.provider = selected.provider
-    options.model = selected.model
+    try {
+      options.provider = selected.provider
+      options.model = selected.model
+    } catch (error: unknown) {
+      // Best-effort refinement: the create-time route from `agentOptions()`
+      // already guarantees children a concrete model, so a loop that ever
+      // freezes options must degrade to a warning, not fail adoption.
+      logger.warn(`dshacp: could not sync the model route into the agent options: ${String(error)}`)
+    }
   }
 
   /** Whether a session has produced nothing — the only state a mode switch may mutate (D9). */
