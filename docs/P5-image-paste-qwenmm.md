@@ -202,6 +202,7 @@ if (text.trim().length === 0) throw invalidParams('empty prompt')
   - 后果：`read_image` 返回 DSH 原生 image block（attachment 引用）进入消息历史，`dsh-llm-pi-ai` 将其序列化为 `image_url` 变体，而 **Console Go 上游 schema 只接受 `text`** → `400 invalid_request_error: unknown variant 'image_url', expected 'text'`（`Internal error: turn failed: 400 …`）。
   - 修复：`~/.dsh/settings.yaml` 中 opencode-go 两个模型的 `input` 改回 `[text]`（上游本就不支持 image，声明是假能力；`dsh-llm-pi-ai` 行 827 还会在序列化前抛 `UNSUPPORTED_CONTENT` 兜底）。**待复测**：read_image 被闸门拦截后，模型是否转向 qwenmm `vision_chat`——若仍不转向，落地 Q6-C 强指令。
   - 已污染会话（历史含 image block）必须删除（本机为项目 `.sessions` 下的对应目录），任何路由都无法继续使用该历史。
+- **项 2 复测（2026-08-15 第二次）**：修复生效——模型主动调用 `read_image` 被拦（"模型未声明图像输入"），并**自主转向 qwenmm `vision_chat` / `ocr`**。但工具返回 `401 - Incorrect API key`：`~/.qwen-mm-plugins/config` 中的 key（`sk-ws-` 前缀，115 字符）经 curl 实测 DashScope 兼容端点（`dashscope.aliyuncs.com/compatible-mode/v1/models`）与国际端点均 401，**key 本身无效**（config 格式与加载路径均正确）。需用户提供有效 DashScope key 写入该文件；或通过 `DASHSCOPE_BASE_URL` + 对应 key 指向其他 OpenAI 兼容 VL 服务。
 
 ---
 
