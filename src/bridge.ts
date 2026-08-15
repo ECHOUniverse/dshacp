@@ -871,11 +871,16 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     record.usage.cacheRead += usage.cacheReadTokens ?? 0
     record.usage.cacheWrite += usage.cacheWriteTokens ?? 0
     record.usage.reasoning += usage.reasoningTokens ?? 0
-    // "Tokens currently in context": input + output + cache-read.
-    // Excludes reasoningTokens (subset of outputTokens) and cacheWriteTokens
-    // (input-side cache-write traffic, not context occupancy) to avoid double
-    // counting — matching the token-meter `usageTokens` convention.
-    const used = record.usage.input + record.usage.output + record.usage.cacheRead
+    // "Tokens currently in context": input + cache-read + non-reasoning output.
+    // reasoningTokens is a subset of outputTokens (DeepSeek's completion_tokens
+    // already includes reasoning), and reasoning_content does NOT participate in
+    // the next turn's context (DeepSeek Thinking Mode), so it is subtracted out
+    // of output rather than merely "not double-counted". cacheWriteTokens is
+    // input-side cache-write traffic (not a DeepSeek wire field), also excluded.
+    // This matches the token-meter context-occupancy/compaction convention:
+    // reasoning never contributes to context occupancy.
+    const used = record.usage.input + record.usage.cacheRead
+      + Math.max(0, record.usage.output - record.usage.reasoning)
     if (used <= 0) return
     const size = sessionOf(record).requestContext()?.contextWindow ?? 0
     notify({
