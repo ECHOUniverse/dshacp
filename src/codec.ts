@@ -147,3 +147,33 @@ export function toolResultToText(
   }
   return parts.length > 0 ? parts.join('\n') : '(no text output)'
 }
+
+/** Separator between the provider route and the model id in a model-option value. */
+export const MODEL_OPTION_SEPARATOR = ':'
+
+/**
+ * Encode a provider/model pair as the `model` config-option value. Model ids
+ * are not unique across providers (deepseek-v4-flash may exist on several
+ * routes), so the option value must carry the provider — otherwise two
+ * providers offering the same model collide in the client's picker and the
+ * current value matches both.
+ * @param provider - the provider route (catalog group id).
+ * @param model - the provider-owned model id.
+ * @returns the option value, e.g. `opencode-go:deepseek-v4-flash`.
+ */
+export function encodeModelOption(provider: string, model: string): string {
+  return `${provider}${MODEL_OPTION_SEPARATOR}${model}`
+}
+
+/**
+ * Split a model-option value back into provider and model. A value without
+ * the separator is a bare model id (a legacy `default_config_options` entry);
+ * the caller resolves it against the model catalog.
+ * @param value - the option value received on `session/set_config_option`.
+ * @returns the parsed pair, or `undefined` for a bare model id.
+ */
+export function parseModelOption(value: string): { provider: string; model: string } | undefined {
+  const index = value.indexOf(MODEL_OPTION_SEPARATOR)
+  if (index <= 0 || index === value.length - 1) return undefined
+  return { provider: value.slice(0, index), model: value.slice(index + 1) }
+}

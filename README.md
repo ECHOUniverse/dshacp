@@ -96,11 +96,16 @@ works:
   "args": [],
   "env": {},
   "default_config_options": {
-    "model": "deepseek-v4-pro",
+    "model": "deepseek-official:deepseek-v4-pro",
     "thought_level": "high"
   }
 }
 ```
+
+The `model` option value is `provider:model` — identical model ids on
+different providers are distinct in the picker. A bare model id also works:
+it resolves to the single provider that owns it, or keeps the current
+provider when several do.
 
 Credentials: the DeepSeek adapter reads `DEEPSEEK_API_KEY` from
 `~/.dsh/.credentials.yaml` (or the environment). Zed injects no keys for

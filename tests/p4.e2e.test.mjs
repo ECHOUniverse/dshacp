@@ -80,6 +80,15 @@ test('session/new returns model/thinking/mode config options (DESIGN D3/D7)', as
   assert.ok(model.options.length > 0, 'model options non-empty')
   assert.ok(model.options.some(option => option.value === model.currentValue),
     'current model is one of the offered models')
+  // Option values are provider-qualified so identical model ids on different
+  // providers stay distinct in the client picker (and the current value
+  // highlights exactly one option).
+  const modelValues = model.options.flatMap(option =>
+    'group' in option ? option.options.map(item => item.value) : [option.value])
+  assert.ok(modelValues.every(value => value.includes(':')),
+    'model option values are provider-qualified')
+  assert.equal(modelValues.filter(value => value === model.currentValue).length, 1,
+    'current value highlights exactly one model option')
 
   const thinking = options.find(option => option.id === 'thought_level')
   assert.ok(thinking, 'thinking option present for a reasoning-capable model')
@@ -131,6 +140,37 @@ test('set_config_option validates unknown models and efforts', async () => {
   )
   await assert.rejects(
     bridge.client.setSessionConfigOption({ sessionId: created.sessionId, configId: 'unknown_option', value: 'x' }),
+    (error) => error.code === -32602,
+  )
+  await bridge.client.closeSession({ sessionId: created.sessionId })
+})
+
+test('model config option accepts provider-qualified and bare ids', async () => {
+  const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+  // Provider-qualified value (what the picker sends).
+  const qualified = await bridge.client.setSessionConfigOption({
+    sessionId: created.sessionId,
+    configId: 'model',
+    value: 'deepseek-official:deepseek-v4-pro',
+  })
+  assert.equal(qualified.configOptions.find(option => option.id === 'model').currentValue,
+    'deepseek-official:deepseek-v4-pro')
+  // Bare id (a legacy default_config_options entry) resolves to the single
+  // owning provider.
+  const bare = await bridge.client.setSessionConfigOption({
+    sessionId: created.sessionId,
+    configId: 'model',
+    value: 'deepseek-v4-flash',
+  })
+  assert.equal(bare.configOptions.find(option => option.id === 'model').currentValue,
+    'deepseek-official:deepseek-v4-flash')
+  // A qualified value naming an unknown provider is rejected.
+  await assert.rejects(
+    bridge.client.setSessionConfigOption({
+      sessionId: created.sessionId,
+      configId: 'model',
+      value: 'no-such-provider:deepseek-v4-pro',
+    }),
     (error) => error.code === -32602,
   )
   await bridge.client.closeSession({ sessionId: created.sessionId })

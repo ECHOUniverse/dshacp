@@ -43,6 +43,7 @@ import {
   type ResumeSessionRequest,
   type ResumeSessionResponse,
   type SessionConfigOption,
+  type SessionConfigSelectOptions,
   type SessionInfo,
   type SessionNotification,
   type SetSessionConfigOptionRequest,
@@ -74,6 +75,8 @@ import type {} from '@deepseek-ai/dsh-agent-presets'
 import { type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval/types'
 import {
   acpPromptToText,
+  encodeModelOption,
+  parseModelOption,
   parseToolArguments,
   promptHasUnsupportedContent,
   todoToPlanEntries,
@@ -402,33 +405,42 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     const catalog = groups ?? await buildModelCatalog()
     const selection = selectionFor(record).current ?? { provider: DEFAULT_PROVIDER, model: DEFAULT_MODEL }
     const options: SessionConfigOption[] = []
-    const flatModels = catalog.flatMap(group => group.models)
-    // Model select: flat when one provider route, grouped otherwise.
-    const modelOptions = catalog.length > 1
-      ? catalog.map(group => ({
-          group: group.id,
-          name: group.name,
-          options: group.models.map(model => ({
-            name: model.name,
-            value: model.id,
-            ...withDefined(model, 'description'),
-          })),
-        }))
-      : (catalog[0]?.models.map(model => ({
+    // Model select: flat when one provider route, grouped otherwise. Values
+    // are `provider:model` — model ids are not unique across providers, and
+    // the current value must highlight exactly one option.
+    let modelOptions: SessionConfigSelectOptions = []
+    if (catalog.length > 1) {
+      modelOptions = catalog.map(group => ({
+        group: group.id,
+        name: group.name,
+        options: group.models.map(model => ({
           name: model.name,
-          value: model.id,
+          value: encodeModelOption(group.id, model.id),
           ...withDefined(model, 'description'),
-        })) ?? [])
+        })),
+      }))
+    } else if (catalog[0] !== undefined) {
+      const single = catalog[0]
+      modelOptions = single.models.map(model => ({
+        name: model.name,
+        value: encodeModelOption(single.id, model.id),
+        ...withDefined(model, 'description'),
+      }))
+    }
     options.push({
       id: MODEL_OPTION_ID,
       name: 'Model',
       category: 'model',
       type: 'select',
-      currentValue: selection.model,
+      currentValue: encodeModelOption(selection.provider, selection.model),
       options: modelOptions,
     })
     // Thinking select: only when the current model exposes reasoning efforts.
-    const currentInfo = flatModels.find(model => model.id === selection.model)
+    // Resolve the current model within its own provider group — the same id
+    // may exist on several providers with different efforts.
+    const currentInfo = catalog
+      .find(group => group.id === selection.provider)
+      ?.models.find(model => model.id === selection.model)
     const efforts = currentInfo?.reasoning?.efforts ?? []
     if (efforts.length > 0) {
       const currentEffort = selection.reasoningEffort
@@ -488,14 +500,40 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     const selection = selectionFor(record)
     if (params.configId === MODEL_OPTION_ID) {
       const groups = await buildModelCatalog()
-      const provider = groups.find(group => group.models.some(model => model.id === params.value))?.id
-      if (provider === undefined) throw invalidParams(`unknown model: ${params.value}`)
+      // Resolve the provider for the requested value: a `provider:model` pair
+      // (the option values we emit) or a bare model id (a legacy
+      // `default_config_options` entry). A bare id that exists on exactly one
+      // provider picks it; one that exists on several keeps the current
+      // provider when it owns the model, otherwise the ambiguity is rejected.
+      const parsed = parseModelOption(params.value)
+      const modelId = parsed?.model ?? params.value
+      const owningProviders = groups
+        .filter(group => group.models.some(model => model.id === modelId))
+        .map(group => group.id)
+      let provider: string
+      if (parsed !== undefined) {
+        if (!owningProviders.includes(parsed.provider)) throw invalidParams(`unknown model: ${params.value}`)
+        provider = parsed.provider
+      } else if (owningProviders.length === 1) {
+        provider = owningProviders[0]!
+      } else if (owningProviders.length > 1) {
+        const current = selection.current
+        if (current !== undefined && owningProviders.includes(current.provider)) {
+          provider = current.provider
+        } else {
+          throw invalidParams(
+            `model "${params.value}" exists on multiple providers (${owningProviders.join(', ')}); select it with provider:model`,
+          )
+        }
+      } else {
+        throw invalidParams(`unknown model: ${params.value}`)
+      }
       let info: { reasoning?: { defaultEffort?: string; efforts: readonly { id: string }[] } }
       try {
         // Validate through the llm runtime exactly like the web app's model
         // picker (DESIGN §12.4.3), then read the target model's metadata.
-        await ctx.llm.resolveCallConfig({ provider, model: params.value })
-        info = await ctx.llm.resolveModelInfo(provider, params.value)
+        await ctx.llm.resolveCallConfig({ provider, model: modelId })
+        info = await ctx.llm.resolveModelInfo(provider, modelId)
       } catch (error: unknown) {
         throw invalidParams(`unknown model: ${params.value} (${String(error)})`)
       }
@@ -505,7 +543,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       const defaultEffort = info.reasoning?.defaultEffort ?? info.reasoning?.efforts[0]?.id
       selection.current = {
         provider,
-        model: params.value,
+        model: modelId,
         ...(defaultEffort !== undefined ? { reasoningEffort: ReasoningEffortId(defaultEffort) } : {}),
       }
       return groups

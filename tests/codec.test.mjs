@@ -3,6 +3,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   acpPromptToText,
+  encodeModelOption,
+  parseModelOption,
   parseToolArguments,
   promptHasUnsupportedContent,
   todoToPlanEntries,
@@ -80,4 +82,18 @@ test('toolResultToText unwraps tool-result blocks', () => {
     toolResultToText([{ type: 'tool-result', toolCallId: 'c', content: [{ type: 'text', text: 'denied' }] }]),
     'denied',
   )
+})
+
+test('encodeModelOption qualifies a model id with its provider', () => {
+  assert.equal(encodeModelOption('opencode-go', 'deepseek-v4-flash'), 'opencode-go:deepseek-v4-flash')
+  assert.equal(encodeModelOption('deepseek-official', 'deepseek-v4-flash'), 'deepseek-official:deepseek-v4-flash')
+})
+
+test('parseModelOption splits provider-qualified values and rejects bare ids', () => {
+  assert.deepEqual(parseModelOption('opencode-go:deepseek-v4-flash'), { provider: 'opencode-go', model: 'deepseek-v4-flash' })
+  assert.equal(parseModelOption('deepseek-v4-flash'), undefined)
+  assert.equal(parseModelOption(':model'), undefined)
+  assert.equal(parseModelOption('provider:'), undefined)
+  // a model id containing a separator still splits at the first one
+  assert.deepEqual(parseModelOption('p:a:b'), { provider: 'p', model: 'a:b' })
 })

@@ -382,12 +382,17 @@ unavailable. Phase 4 replaces that copy with the real thing.
 - **Model selection seeding**: the `dshacp` row's optional `provider`/`model` still seed each
   session's selection; absent that, the fallback chain is the session's `request/header`
   (resume restore) then `agent-default-model` (composition default + settings).
-- **Model option values** are model ids (provider discovered from the catalog on set); the
-  catalog is grouped by provider when more than one route is live. The model branch validates
-  through `llm.resolveCallConfig` (the web picker's exact mechanism) and reads the target
-  model's metadata for the D8 thinking reset; a target without an adapter `defaultEffort`
-  pins the first offered effort so the stored selection and the displayed option always
-  agree.
+- **Model option values** are `provider:model` — model ids are not unique across providers
+  (deepseek-v4-flash may exist on several routes), so a bare id would collide in the client
+  picker and the current value would highlight every option carrying it. The catalog is
+  grouped by provider when more than one route is live; `set_config_option` accepts the
+  qualified value (what the picker sends) or a bare model id (a legacy
+  `default_config_options` entry), resolving a bare id to the single owning provider or — when
+  several own it — keeping the current provider, and rejecting only when the current provider
+  does not own it. The model branch validates through `llm.resolveCallConfig` (the web
+  picker's exact mechanism) and reads the target model's metadata for the D8 thinking reset; a
+  target without an adapter `defaultEffort` pins the first offered effort so the stored
+  selection and the displayed option always agree.
 - **`thought_level` is conditional**: the option is emitted only when the current model
   exposes reasoning efforts (a non-reasoning model gets model + mode only) — Zed renders
   exactly the options it receives, and a selector over a non-existent knob would be noise.
