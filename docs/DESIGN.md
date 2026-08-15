@@ -393,6 +393,12 @@ unavailable. Phase 4 replaces that copy with the real thing.
   picker's exact mechanism) and reads the target model's metadata for the D8 thinking reset; a
   target without an adapter `defaultEffort` pins the first offered effort so the stored
   selection and the displayed option always agree.
+- **The last chosen model/thinking combination is remembered**: a successful
+  `set_config_option` (model or thinking) persists the full `{provider, model,
+  reasoningEffort}` selection through `agent-default-model.saveSelection` — the same settings
+  write the web Models page makes (`~/.dsh/settings.yaml` → `agent-default-model`). Fresh
+  sessions therefore start from the last chosen combination instead of the composition
+  default; the write is best-effort (a failure warns and never fails the switch).
 - **`thought_level` is conditional**: the option is emitted only when the current model
   exposes reasoning efforts (a non-reasoning model gets model + mode only) — Zed renders
   exactly the options it receives, and a selector over a non-existent knob would be noise.

@@ -3,7 +3,7 @@
 // like Zed). Prompt tests need a real model credential and skip without one.
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { rm } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { PROJECT_ROOT, TEST_HOME, TEST_SESSIONS, hasModelCredential, makeTestHome, spawnBridge, waitFor } from './harness.mjs'
@@ -174,6 +174,60 @@ test('model config option accepts provider-qualified and bare ids', async () => 
     (error) => error.code === -32602,
   )
   await bridge.client.closeSession({ sessionId: created.sessionId })
+})
+
+test('model/thinking switches are remembered as the default for fresh sessions', async () => {
+  // Isolated home so the shared harness home (and the machine's real ~/.dsh)
+  // is never mutated by this test.
+  const home = join(PROJECT_ROOT, `.test-home-persist-${process.pid}`)
+  await rm(home, { recursive: true, force: true })
+  await mkdir(home, { recursive: true })
+  await writeFile(join(home, 'settings.yaml'), [
+    'permission:',
+    '  defaultPreset: workspace-write',
+    'agent-default-model:',
+    '  provider: deepseek-official',
+    '  model: deepseek-v4-flash',
+    '',
+  ].join('\n'), 'utf8')
+  const spawned = spawnBridge({ env: { DSH_HOME: home } })
+  try {
+    await waitFor(async () => {
+      try {
+        await spawned.client.initialize({
+          protocolVersion: 1,
+          clientCapabilities: {},
+          clientInfo: { name: 'dshacp-p4-test', version: '0.0.1' },
+        })
+        return true
+      } catch {
+        return false
+      }
+    }, 60000)
+
+    // Session A: pick a model + thinking combination.
+    const a = await spawned.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+    await spawned.client.setSessionConfigOption({ sessionId: a.sessionId, configId: 'model', value: 'deepseek-official:deepseek-v4-pro' })
+    await spawned.client.setSessionConfigOption({ sessionId: a.sessionId, configId: 'thought_level', value: 'off' })
+    await spawned.client.closeSession({ sessionId: a.sessionId })
+
+    // Session B (fresh): starts from the remembered combination.
+    const b = await spawned.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+    const modelB = b.configOptions.find(option => option.id === 'model')
+    const thinkB = b.configOptions.find(option => option.id === 'thought_level')
+    assert.equal(modelB.currentValue, 'deepseek-official:deepseek-v4-pro', 'fresh session starts on the remembered model')
+    assert.equal(thinkB.currentValue, 'off', 'fresh session starts on the remembered thinking')
+    await spawned.client.closeSession({ sessionId: b.sessionId })
+
+    // The settings document on disk carries the combination.
+    const settings = await readFile(join(home, 'settings.yaml'), 'utf8')
+    assert.match(settings, /provider: deepseek-official/, 'provider persisted')
+    assert.match(settings, /model: deepseek-v4-pro/, 'model persisted')
+    assert.match(settings, /reasoningEffort: off/, 'thinking persisted')
+  } finally {
+    await spawned.stop()
+    await rm(home, { recursive: true, force: true })
+  }
 })
 
 test('mode switches only a blank session; a started session soft-rejects (D9)', async () => {

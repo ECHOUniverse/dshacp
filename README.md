@@ -107,6 +107,10 @@ different providers are distinct in the picker. A bare model id also works:
 it resolves to the single provider that owns it, or keeps the current
 provider when several do.
 
+The last model/thinking combination you pick is remembered: it is saved to
+`~/.dsh/settings.yaml` (`agent-default-model`, the same default the web app
+writes), so fresh sessions start from your last choice.
+
 Credentials: the DeepSeek adapter reads `DEEPSEEK_API_KEY` from
 `~/.dsh/.credentials.yaml` (or the environment). Zed injects no keys for
 custom agents.

@@ -229,9 +229,32 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   const mountedMcp = new Map<string, Promise<{ dispose: () => Promise<void> } | undefined>>()
   let conn: AgentSideConnection
 
-  /** The default-model service (base `agent-default-model` row), read structurally. */
-  const defaultModelService = (): { currentSelection(): ModelSelection } | undefined =>
-    ctx.get('agentDefaultModel') as { currentSelection(): ModelSelection } | undefined
+  /**
+   * The default-model service (base `agent-default-model` row), read
+   * structurally. `saveSelection` persists the chosen provider/model/effort
+   * into the user's settings document — the same write the web Models page
+   * makes — so the next fresh session starts from the last chosen combination.
+   */
+  interface DefaultModelService {
+    currentSelection(): ModelSelection
+    saveSelection(next: ModelSelection): Promise<void>
+  }
+  const defaultModelService = (): DefaultModelService | undefined =>
+    ctx.get('agentDefaultModel') as DefaultModelService | undefined
+
+  /**
+   * Persist the session's chosen model/thinking combination as the deployment
+   * default (DESIGN D14 extension: "remember the last combination"). Best
+   * effort — a settings write failure never fails the option switch.
+   */
+  const persistSelection = (record: SessionRecord): void => {
+    const selected = selectionFor(record).current
+    const defaults = defaultModelService()
+    if (selected === undefined || defaults === undefined) return
+    defaults.saveSelection(selected).catch((error: unknown) => {
+      logger.warn(`dshacp: the model selection applies to this session but was not saved as the default: ${String(error)}`)
+    })
+  }
 
   /** The agent-presets roster (base/preset composition), read structurally. */
   const presetRoster = (): AgentPresets | undefined => ctx.get('agentPresets') as AgentPresets | undefined
@@ -546,6 +569,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         model: modelId,
         ...(defaultEffort !== undefined ? { reasoningEffort: ReasoningEffortId(defaultEffort) } : {}),
       }
+      persistSelection(record)
       return groups
     } else if (params.configId === THINKING_OPTION_ID) {
       const current = selection.current
@@ -564,6 +588,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         model: current.model,
         reasoningEffort: ReasoningEffortId(params.value),
       }
+      persistSelection(record)
     } else if (params.configId === MODE_OPTION_ID) {
       const presets = presetRoster()
       if (presets === undefined) throw invalidParams('this deployment composes no agent presets')
