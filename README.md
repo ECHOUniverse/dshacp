@@ -60,6 +60,35 @@ dsh --version
 dsh plugin --profile acp add @hanxu131/dshacp
 ```
 
+> 首次安装会直接装到 npm 上的最新版（`latest`），无需指定版本号。
+
+### 更新到新版本
+
+已装过的用户升级时，**推荐直接用 `update` 命令**（无需手动写版本号）：
+
+```sh
+dsh plugin --profile acp update @hanxu131/dshacp
+```
+
+为了让它稳定生效，先在 profile 目录的 `pnpm-workspace.yaml` 里**永久关闭发布年龄门控**，
+加一行 `minimumReleaseAge: 0`：
+
+```sh
+# 打开 ~/.dsh/profiles/acp/pnpm-workspace.yaml，在 autoInstallPeers 那行下面加上：
+minimumReleaseAge: 0
+```
+
+> 没有这行时，npm 上刚发布的新版本（官方默认"发布年龄"需满数天）会被 pnpm 的
+> 供应链门控挡下，`update` 会误报 `Already up to date`。设为 `0` 即永久关闭门控，
+> 之后 `update` 会正常追到最新版。
+
+升级完成后，**退出并重开 Zed 里的 DSH 会话**（或重启 `dsh --profile acp` 进程），
+新代码才会被加载。
+
+> 备选：若不想改配置，也可显式带版本号
+> `dsh plugin --profile acp add "@hanxu131/dshacp@^0.1.4"`；但由于 `add` 存在
+> lock 锁定、`update` 更省心，日常仍建议用上面的 `update` 方式。
+
 ## 第 2 步：在 Zed 里添加 DSH
 
 1. 打开 Zed，按 `Cmd + ,`（macOS）或 `Ctrl + ,` 打开 **Settings（设置）**。
@@ -115,6 +144,38 @@ DeepSeek API Key 即可。
 
 每次对话都保存在**当前项目目录**下的 `.sessions` 文件夹里（换项目 = 新一批对话）。
 想统一存到别处，可以设置环境变量 `DSH_SESSIONS_ROOT`（见下文）。
+
+### 5. 重新 `add` 插件却没升级到新版本
+
+这是 **pnpm 的版本锁定/发布年龄门控**导致的，不是命令写错：
+
+- `dsh plugin add` 底层就是 pnpm 的 `add`。**只要 profile 目录里的 `pnpm-lock.yaml`
+  已经锁定了某个版本，即使 npm 上出了更新版，`add` 也不会主动跳版本**——它会返回
+  `Already up to date`。
+- 新发布的版本在 pnpm 的"最低发布年龄"（minimum release age，默认数天）之内时，
+  `update` 也会被供应链安全门控挡下，同样显示 `Already up to date`。
+
+**推荐做法：永久关闭门控 + 用 `update` 追新**（见「第 1 步 → 更新到新版本」）。
+在 `~/.dsh/profiles/acp/pnpm-workspace.yaml` 加一行 `minimumReleaseAge: 0` 后，
+升级命令就固定为：
+
+```sh
+dsh plugin --profile acp update @hanxu131/dshacp
+```
+
+若不愿改配置，也可以临时显式带版本号（profile 名 `acp`、包名 `@hanxu131/dshacp`，
+从 `0.1.3` 升到 `0.1.4`）：
+
+```sh
+# ✅ 临时可行：显式带上目标版本范围
+dsh plugin --profile acp add "@hanxu131/dshacp@^0.1.4"
+
+# ❌ 无效：不带版本、或只写 @latest，都会被锁定/门控挡住
+dsh plugin --profile acp add @hanxu131/dshacp
+dsh plugin --profile acp add "@hanxu131/dshacp@latest"
+```
+
+升级完记得**重启 Zed 里的 DSH 会话**（或重启 `dsh --profile acp` 进程）让新代码生效。
 
 ---
 

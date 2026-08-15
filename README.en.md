@@ -72,6 +72,38 @@ In a terminal, run this one command:
 dsh plugin --profile acp add @hanxu131/dshacp
 ```
 
+> First-time installs fetch the latest version (`latest`) directly — no version
+> number needed.
+
+### Updating to a newer version
+
+If you already installed it and want to upgrade, **prefer the `update` command**
+(no version number needed):
+
+```sh
+dsh plugin --profile acp update @hanxu131/dshacp
+```
+
+For this to work reliably, **permanently disable the release-age gate** in the
+profile's `pnpm-workspace.yaml` by adding one line:
+
+```sh
+# open ~/.dsh/profiles/acp/pnpm-workspace.yaml, add below the autoInstallPeers line:
+minimumReleaseAge: 0
+```
+
+> Without this line, a version released only recently (pnpm's default
+> "minimum release age" is a few days) gets blocked by supply-chain gating and
+> `update` wrongly reports `Already up to date`. Setting it to `0` disables the
+> gate permanently, so `update` always fetches the latest version.
+
+After upgrading, **quit and reopen the DSH session in Zed** (or restart the
+`dsh --profile acp` process) so the new code is actually loaded.
+
+> Alternative: if you'd rather not edit the config, you can pin the version
+> explicitly — `dsh plugin --profile acp add "@hanxu131/dshacp@^0.1.4"`. But
+> because of pnpm's lock behavior, `update` is the easier day-to-day choice.
+
 Breaking it down:
 
 - `dsh plugin` = use DSH's plugin manager
@@ -155,6 +187,40 @@ this plugin — ask the maintainer to add the DeepSeek API key to DSH.
 Conversations are saved under a `.sessions` folder in the **current project
 directory** (a new project = a new set of conversations). To store them all in
 one place, set the `DSH_SESSIONS_ROOT` environment variable (see below).
+
+### 5. Re-running `add` doesn't upgrade to the new version
+
+This is **pnpm's version-locking / release-age gating**, not a mistake in the command:
+
+- `dsh plugin add` wraps pnpm's `add`. Once the profile's `pnpm-lock.yaml` has
+  pinned a version, `add` **won't jump to a newer version** even if one exists on
+  npm — it just prints `Already up to date`.
+- Versions younger than pnpm's "minimum release age" (a few days by default) are
+  also blocked by supply-chain gating, so `update` shows `Already up to date`
+  too.
+
+**Recommended fix: disable the gate permanently and use `update`** (see
+"Step 1 → Updating to a newer version"). Add `minimumReleaseAge: 0` to
+`~/.dsh/profiles/acp/pnpm-workspace.yaml`, then the upgrade command is simply:
+
+```sh
+dsh plugin --profile acp update @hanxu131/dshacp
+```
+
+If you'd rather not edit the config, pin the version explicitly instead (profile
+`acp`, package `@hanxu131/dshacp`, upgrading `0.1.3` → `0.1.4`):
+
+```sh
+# ✅ Works ad hoc: pin the target range explicitly
+dsh plugin --profile acp add "@hanxu131/dshacp@^0.1.4"
+
+# ❌ Does NOT work: no version, or only @latest — both are blocked by locking/gating
+dsh plugin --profile acp add @hanxu131/dshacp
+dsh plugin --profile acp add "@hanxu131/dshacp@latest"
+```
+
+After upgrading, **restart the DSH session in Zed** (or restart the
+`dsh --profile acp` process) so the new code takes effect.
 
 ---
 
