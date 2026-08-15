@@ -69,3 +69,22 @@
 # is unselectable. The same row the web app mounts.
 - id: cordis-host-runner
   name: '@deepseek-ai/dsh-cordis-host-runner'
+
+# P5: qwenmm 视觉理解（qwen-mm-plugins api 能力）。host 层挂载 dsh-mcp-client，
+# 工具以 mcp__qwen-mm-plugins-api__* 进入每个会话的工具目录（与 forwardMcpServers
+# 同一条注册路）。DashScope key 必须放 ~/.qwen-mm-plugins/config（dsh-mcp-client
+# 会 scrub 子进程环境里的凭据形变量，env 注入会被滤掉）。uv/uvx 需预先安装。
+# failOnStartupError: false 保证缺 uvx/key 时 DSHACP 仍能启动、只是该 MCP 工具
+# 不可用（Q8 自然失败）。
+- id: mcp-qwen-mm-plugins-api
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: qwen-mm-plugins-api
+    transport: stdio
+    command: uvx
+    args:
+      - '--from'
+      - 'qwen-mm-plugins[api] @ git+https://github.com/QwenLM/Qwen-MM-Plugins.git@qwen-mm-plugins-api-v1.0.3'
+      - 'qwen-mm-plugins-api'
+    cwd: !!js process.cwd()
+    failOnStartupError: false

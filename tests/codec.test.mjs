@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import {
   acpPromptToText,
   encodeModelOption,
+  imageExtensionForMime,
   parseModelOption,
   parseToolArguments,
   promptHasUnsupportedContent,
@@ -61,9 +62,25 @@ test('acpPromptToText concatenates text and renders resource links', () => {
   assert.ok(text.includes('file:///tmp/x'))
 })
 
-test('promptHasUnsupportedContent accepts baseline and rejects richer blocks', () => {
+test('promptHasUnsupportedContent accepts baseline and image, rejects audio/resource (P5)', () => {
   assert.equal(promptHasUnsupportedContent([{ type: 'text', text: 'hi' }]), false)
-  assert.equal(promptHasUnsupportedContent([{ type: 'image', data: 'AAAA' }]), true)
+  assert.equal(promptHasUnsupportedContent([{ type: 'resource_link', name: 'n', uri: 'file:///x' }]), false)
+  assert.equal(promptHasUnsupportedContent([{ type: 'image', data: 'AAAA', mimeType: 'image/png' }]), false)
+  assert.equal(promptHasUnsupportedContent([{ type: 'audio', data: 'AAAA' }]), true)
+  assert.equal(promptHasUnsupportedContent([{ type: 'resource', name: 'n', uri: 'file:///x' }]), true)
+})
+
+test('imageExtensionForMime maps the P5 whitelist and rejects everything else', () => {
+  assert.equal(imageExtensionForMime('image/png'), '.png')
+  assert.equal(imageExtensionForMime('image/jpeg'), '.jpg')
+  assert.equal(imageExtensionForMime('image/jpg'), '.jpg')
+  assert.equal(imageExtensionForMime('image/webp'), '.webp')
+  assert.equal(imageExtensionForMime('image/gif'), '.gif')
+  // case and surrounding whitespace are tolerated
+  assert.equal(imageExtensionForMime('  IMAGE/PNG  '), '.png')
+  assert.equal(imageExtensionForMime('image/svg+xml'), undefined)
+  assert.equal(imageExtensionForMime('image/tiff'), undefined)
+  assert.equal(imageExtensionForMime(''), undefined)
 })
 
 test('parseToolArguments parses JSON and preserves malformed input', () => {

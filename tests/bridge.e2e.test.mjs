@@ -3,7 +3,7 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile, rm, writeFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PROJECT_ROOT, TEST_HOME, TEST_SESSIONS, hasModelCredential, makeTestHome, spawnBridge, waitFor } from './harness.mjs'
 
@@ -50,7 +50,8 @@ test('initialize negotiates the DESIGN §5 surface', async () => {
   })
   assert.equal(init.protocolVersion, 1)
   assert.equal(init.agentCapabilities.loadSession, true)
-  assert.deepEqual(init.agentCapabilities.promptCapabilities, {})
+  // P5: the bridge advertises (and handles) image pasting.
+  assert.deepEqual(init.agentCapabilities.promptCapabilities, { image: true })
   assert.ok(init.agentCapabilities.sessionCapabilities.list)
   assert.ok(init.agentCapabilities.sessionCapabilities.resume)
   assert.ok(init.agentCapabilities.sessionCapabilities.close)
@@ -73,12 +74,75 @@ test('session/new rejects a relative cwd', async () => {
   )
 })
 
-test('session/prompt rejects unsupported content blocks', async () => {
+test('session/prompt rejects audio and resource blocks (P5)', async () => {
   const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
   await assert.rejects(
-    bridge.client.prompt({ sessionId: created.sessionId, prompt: [{ type: 'image', data: 'AAAA' }] }),
+    bridge.client.prompt({ sessionId: created.sessionId, prompt: [{ type: 'audio', data: 'AAAA' }] }),
     (error) => error.code === -32602,
   )
+  await assert.rejects(
+    bridge.client.prompt({ sessionId: created.sessionId, prompt: [{ type: 'resource', name: 'n', uri: 'file:///x' }] }),
+    (error) => error.code === -32602,
+  )
+  await bridge.client.closeSession({ sessionId: created.sessionId })
+})
+
+test('session/prompt rejects pasted images outside the png/jpeg/webp/gif whitelist (P5)', async () => {
+  const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+  await assert.rejects(
+    bridge.client.prompt({ sessionId: created.sessionId, prompt: [{ type: 'image', data: 'AAAA', mimeType: 'image/svg+xml' }] }),
+    (error) => error.code === -32602 && /unsupported pasted image type: image\/svg\+xml/.test(error.message),
+  )
+  await bridge.client.closeSession({ sessionId: created.sessionId })
+})
+
+test('session/prompt accepts image blocks, lands them in tmp, and replays the path markers (P5)', { skip: !PROMPT_AVAILABLE }, async () => {
+  // Two distinguishable 1×1 PNGs (solid red / solid blue): identical bytes
+  // would make the wire-order assertion below vacuous.
+  const redPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC'
+  const bluePng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC'
+  const expected = [redPng, bluePng]
+  const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+  const result = await bridge.client.prompt({
+    sessionId: created.sessionId,
+    prompt: [
+      { type: 'text', text: 'Reply with exactly: ok' },
+      { type: 'image', data: redPng, mimeType: 'image/png' },
+      { type: 'image', data: bluePng, mimeType: 'image/png' },
+    ],
+  })
+  assert.equal(result.stopReason, 'end_turn')
+  await bridge.client.closeSession({ sessionId: created.sessionId })
+
+  // Load into a fresh thread: the replay must carry one marker per image,
+  // in wire order, each pointing at a real dshacp-*.png file in os.tmpdir()
+  // whose bytes match the pasted image.
+  const replayStart = bridge.updates.length
+  await bridge.client.loadSession({ sessionId: created.sessionId, cwd: PROJECT_ROOT, mcpServers: [] })
+  const userText = bridge.updates.slice(replayStart)
+    .filter(update => update.kind === 'session_update' && update.tag === 'user_message_chunk')
+    .map(update => update.update.content.text)
+    .join('')
+  const markers = [...userText.matchAll(/\[用户粘贴的图片: (\S+) — 如需理解图片内容，请调用 qwenmm 的 vision_chat \/ ocr 工具\]/g)]
+  assert.equal(markers.length, 2, 'replay carries one pasted-image marker per image')
+  const paths = [...new Set(markers.map(match => match[1]))]
+  assert.equal(paths.length, 2, 'each image gets its own tmp path')
+  // os.tmpdir() (e.g. /var/folders/.../T on macOS) is the documented landing
+  // spot; assert against it rather than the /tmp symlink.
+  const tmpPrefix = `${tmpdir()}/`
+  try {
+    for (const [index, match] of markers.entries()) {
+      const path = match[1]
+      assert.ok(path.startsWith(tmpPrefix), `marker points at the os tmpdir: ${path}`)
+      assert.match(path.slice(tmpPrefix.length), /^dshacp-[0-9a-f-]+\.png$/, 'tmp file has the dshacp-<uuid>.png shape')
+      const onDisk = await readFile(path)
+      assert.deepEqual(onDisk, Buffer.from(expected[index], 'base64'),
+        `tmp image ${index} matches the pasted image in wire order`)
+    }
+  } finally {
+    for (const path of paths) await rm(path, { force: true })
+  }
+  await bridge.client.closeSession({ sessionId: created.sessionId })
 })
 
 test('session/close frees the session; close of an unknown session errors', async () => {

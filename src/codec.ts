@@ -63,12 +63,34 @@ export function acpPromptToText(prompt: readonly AcpContentBlock[]): string {
  * Whether a prompt carries content beyond the ACP baseline. The spec requires
  * every agent to accept `text` and `resource_link`; richer inline payloads
  * (image, audio, embedded resource) are optional capabilities this bridge does
- * not advertise, so they are rejected rather than silently dropped.
+ * not advertise, so they are rejected rather than silently dropped. Since P5
+ * the bridge advertises (and handles) `image`, so only `audio` and `resource`
+ * are rejected.
  * @param prompt - ACP prompt blocks to inspect.
- * @returns `true` when any block is neither `text` nor `resource_link`.
+ * @returns `true` when any block is neither `text`, `resource_link`, nor `image`.
  */
 export function promptHasUnsupportedContent(prompt: readonly AcpContentBlock[]): boolean {
-  return prompt.some(block => block.type !== 'text' && block.type !== 'resource_link')
+  return prompt.some(block => block.type !== 'text' && block.type !== 'resource_link' && block.type !== 'image')
+}
+
+/** Accepted raster mime types → on-disk extension (P5). */
+const IMAGE_MIME_EXTENSIONS: Record<string, string> = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/jpg': '.jpg',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+}
+
+/**
+ * Map a pasted image's mime type to the on-disk extension used for its tmp
+ * file. Only raster formats the qwenmm vision tools can read are accepted;
+ * anything else (svg, tiff, …) is rejected by the bridge before decoding.
+ * @param mimeType - the ACP image block's mime type.
+ * @returns the extension (with leading dot), or `undefined` when unsupported.
+ */
+export function imageExtensionForMime(mimeType: string): string | undefined {
+  return IMAGE_MIME_EXTENSIONS[mimeType.trim().toLowerCase()]
 }
 
 /**

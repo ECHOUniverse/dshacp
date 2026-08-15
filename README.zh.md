@@ -41,6 +41,31 @@ workflow）、JSONL 会话持久化与 ACP bridge——并复用 `~/.dsh` 配置
 设置）。无 stdout 日志器、无 HMR：stdout 只承载 JSON-RPC，诊断信息全部走
 stderr。
 
+### 粘贴图片理解（P5，可选）
+
+在 Zed agent 面板粘贴截图开箱即用：桥接声明 `image` prompt 能力，接受
+png/jpeg/webp/gif（单张 ≤ 25 MB），把每张图写到 `/tmp/dshacp-<uuid>.<ext>`
+文件，并把路径以文本标记注入 prompt。由于默认 DeepSeek 路由是纯文本的，
+"看图"外包给 **qwenmm**（`QwenLM/Qwen-MM-Plugins` 的 `api` 能力）：其
+`vision_chat` / `ocr` 工具返回文本，模型据此作答。需要三步准备：
+
+1. 安装 `uv` / `uvx`（MCP server 通过 `uvx` 运行）：
+   `curl -LsSf https://astral.sh/uv/install.sh | sh`
+2. 一次性拷贝 qwenmm `api` skill —— `~/.dsh/skills` 下的 skill 会被自动发现
+   （从 tag `qwen-mm-plugins-api-v1.0.3` 的 checkout 拷贝）：
+   ```sh
+   dsh_home=${DSH_HOME:-"$HOME/.dsh"}
+   mkdir -p "$dsh_home/skills"
+   cp -R /path/to/qwen-mm-plugins/src/capabilities/api/skill \
+     "$dsh_home/skills/qwen-mm-plugins-api"
+   ```
+3. 把 DashScope key 写进 `~/.qwen-mm-plugins/config`（运行 qwenmm 仓库的
+   `bash install.sh configure`，或直接写该文件）。**不要**放在 Zed
+   `mcpServers` 的 `env` 里——DSH 会过滤 MCP 子进程环境中的凭据形变量。
+
+MCP 行已 bake 进 `cordis.yml`，且 `failOnStartupError: false`：缺 `uvx` /
+key 时 `dshacp` 照常启动，只是视觉工具在工具卡中失败、模型会报告无法读图。
+
 ## Zed 配置
 
 `settings.json` → AI → External Agents → Add Custom Agent：
@@ -93,6 +118,6 @@ Agent → 客户端：`session/request_permission`、`session/update`。
 - `src/bridge.ts` — 扩展版 ACP v1 bridge（会话记录、流式、审批）
 - `src/codec.ts` — stopReason / 工具 kind / 计划 / prompt 编解码
 - `cordis.yml` — 部署组合（适配器、sandbox、approval、subagent、workflow、
-  fs、todo、持久化）
+  fs、todo、持久化、qwenmm MCP 客户端）
 - `tests/` — 编解码单元测试 + 完整的端到端协议测试（像 Zed 一样使用官方
   `@agentclientprotocol/sdk` 客户端通过 stdio 驱动）

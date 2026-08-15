@@ -12,6 +12,8 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { randomUUID } from 'node:crypto'
+import { writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import Schema from '@deepseek-ai/schemastery'
@@ -76,6 +78,7 @@ import { type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval/types'
 import {
   acpPromptToText,
   encodeModelOption,
+  imageExtensionForMime,
   parseModelOption,
   parseToolArguments,
   promptHasUnsupportedContent,
@@ -107,6 +110,13 @@ export const DEFAULT_MODEL = 'deepseek-v4-flash'
 
 /** Per-tool-call timeout for forwarded MCP servers (the mcp-client default). */
 export const DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS = 60_000
+
+/**
+ * Max bytes accepted for one pasted image before the prompt is rejected (P5).
+ * Pasting is capped at 25 MB per image; larger payloads are refused with a
+ * clear error instead of being written to tmp.
+ */
+export const MAX_PASTED_IMAGE_BYTES = 25 * 1024 * 1024
 
 /**
  * Fixed plan-entry priority for every mapped update (DESIGN §17): DSH todos
@@ -1434,7 +1444,10 @@ export function apply(ctx: Context, config: BridgeConfig): void {
           agentInfo: { name: 'dshacp', version: '0.1.0' },
           agentCapabilities: {
             loadSession: true,
-            promptCapabilities: {},
+            // P5: image pasting is accepted (and handled by this bridge, which
+            // lands each image in tmp and injects its path as text); audio and
+            // embedded resources remain unsupported and are rejected.
+            promptCapabilities: { image: true },
             sessionCapabilities: { list: {}, resume: {}, close: {}, delete: {} },
             // P4b: HTTP MCP servers are forwarded into dsh-mcp-client. Stdio is
             // mandatory per the spec (no capability field); sse/acp are not
@@ -1553,9 +1566,34 @@ export function apply(ctx: Context, config: BridgeConfig): void {
           throw invalidParams('a prompt is already in flight for this session')
         }
         if (promptHasUnsupportedContent(params.prompt)) {
-          throw invalidParams('only text and resource_link prompt content is supported')
+          throw invalidParams('only text, resource_link, and image prompt content is supported')
         }
-        const text = acpPromptToText(params.prompt)
+
+        // P5: image blocks carry base64 raster payloads. Validate the mime
+        // against the whitelist, decode, and land each image in os.tmpdir()
+        // (the host process writes directly, so the model-side fs sandbox
+        // never applies). The default model route is text-only, so the bridge
+        // injects the absolute path as a textual marker and lets the model
+        // call the qwenmm vision_chat / ocr tools to read it.
+        const imageRefs: string[] = []
+        for (const block of params.prompt) {
+          if (block.type !== 'image') continue
+          const ext = imageExtensionForMime(block.mimeType)
+          if (ext === undefined) {
+            throw invalidParams(`unsupported pasted image type: ${block.mimeType} (supported: png/jpeg/webp/gif)`)
+          }
+          const data = Buffer.from(block.data, 'base64')
+          if (data.length > MAX_PASTED_IMAGE_BYTES) {
+            throw invalidParams(`pasted image too large: ${data.length} bytes (max ${MAX_PASTED_IMAGE_BYTES})`)
+          }
+          const path = join(tmpdir(), `dshacp-${randomUUID()}${ext}`)
+          await writeFile(path, data)
+          imageRefs.push(path)
+        }
+
+        const text = acpPromptToText(params.prompt) + imageRefs.map(path =>
+          `\n[用户粘贴的图片: ${path} — 如需理解图片内容，请调用 qwenmm 的 vision_chat / ocr 工具]\n`,
+        ).join('')
         if (text.trim().length === 0) throw invalidParams('empty prompt')
 
         // Not driving a retired agent is this bridge's contract: an

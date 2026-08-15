@@ -64,6 +64,37 @@ presets) — and reuses `~/.dsh` configuration (credentials, settings,
 permission presets, agent presets). No stdout logger, no HMR: stdout carries
 JSON-RPC only, diagnostics go to stderr.
 
+### Pasted-image understanding (P5, optional)
+
+Pasting a screenshot into the Zed agent panel works out of the box: the
+bridge advertises the `image` prompt capability, accepts png/jpeg/webp/gif
+pastes (≤ 25 MB each), writes each image to a `/tmp/dshacp-<uuid>.<ext>` file,
+and injects the path as a text marker. Because the default DeepSeek route is
+text-only, *reading* the image is outsourced to **qwenmm**
+(`QwenLM/Qwen-MM-Plugins`, `api` capability): its `vision_chat` / `ocr` tools
+return text the model can answer from. Setting that up:
+
+1. Install `uv` / `uvx` (the MCP server runs via `uvx`):
+   `curl -LsSf https://astral.sh/uv/install.sh | sh`
+2. Copy the qwenmm `api` skill once — skills under `~/.dsh/skills` are
+   discovered automatically (from a checkout of tag
+   `qwen-mm-plugins-api-v1.0.3`):
+   ```sh
+   dsh_home=${DSH_HOME:-"$HOME/.dsh"}
+   mkdir -p "$dsh_home/skills"
+   cp -R /path/to/qwen-mm-plugins/src/capabilities/api/skill \
+     "$dsh_home/skills/qwen-mm-plugins-api"
+   ```
+3. Put the DashScope key in `~/.qwen-mm-plugins/config` (run `bash
+   install.sh configure` in the qwenmm repo, or write the file yourself). Do
+   **not** put it in Zed's `mcpServers` `env` — DSH filters credential-shaped
+   variables from MCP child environments.
+
+The MCP row is already baked into `cordis.yml` with `failOnStartupError:
+false`, so a missing `uvx` / key never prevents `dshacp` from starting; the
+vision tools simply fail in their tool card and the model reports that it
+cannot read the image.
+
 ## Zed configuration
 
 `settings.json` → AI → External Agents → Add Custom Agent:
@@ -153,7 +184,7 @@ is self-contained; file edits render as tool-call cards, or delegate to Zed's
   approval, config options, slash commands, MCP forwarding, elicitation)
 - `src/codec.ts` — stopReason / tool-kind / plan / prompt codecs
 - `cordis.yml` — the leaf composition: DSHACP-owned rows (agent presets
-  roster, ssh, the app)
+  roster, ssh, the app, the qwenmm MCP client)
 - `dshacp.patch.yml` — the overlay: web-app-style disable list + DSHACP
   persona + persistence root
 - `tests/` — codec units + full e2e protocol tests driven like Zed (official
