@@ -1,0 +1,177 @@
+# DSHACP bundle patch — the layer `dsh plugin add @hanxu131/dshacp` contributes
+# to a profile, applied after `@deepseek-ai/dsh-base` and before the profile's
+# own cordis.patch.yml. Declared by package.json's `dsh.bundle.patch`.
+#
+# This is the BUNDLE form of the DSHACP composition. The STANDALONE form (the
+# `dshacp` bin) composes the same surface from two other shipped files:
+# `cordis.yml` (the root config, which lists the same rows below) plus
+# `dshacp.patch.yml` (the overlay that follows the insert). A bundle has no
+# root config of its own — the profile already provides `dsh-base` — so this
+# one patch both inserts the DSHACP-owned rows and applies the web-app-style
+# disable list in a single layer.
+#
+# Two differences from the standalone form are forced by the install model:
+#   * the app row references this package by name (`@hanxu131/dshacp`) instead of
+#     the relative `./lib/index.js`, so Node resolves the installed package;
+#   * the agent-presets row leaves `roots` empty: the dsh launcher's profile
+#     boot injects the shipped preset root itself, exactly as it does for the
+#     web/headless profiles.
+#
+# Everything else mirrors `cordis.yml` + `dshacp.patch.yml`; keep them in sync
+# when the standalone form changes.
+
+# ── insert the DSHACP-owned rows ───────────────────────────────────────────
+
+- insert:
+    # The preset roster: each ACP session composes its agent from one preset
+    # (standard / cordis / code / minimal). `default` is the starting mode.
+    # `roots` is intentionally empty — the dsh profile boot fills the shipped
+    # `config/agent-presets` root; the plugin appends `~/.dsh/.agent-presets`
+    # (user trust) automatically.
+    - id: agent-presets
+      name: '@deepseek-ai/dsh-agent-presets'
+      config:
+        default: standard
+        roots: []
+
+    # NOTE: the `ssh` row (@linxin666/dsh-ssh) is deliberately absent from the
+    # bundle form. It is itself a DSH bundle whose ssh2 dependency needs a
+    # native build script, which would break the one-command `dsh plugin add`
+    # (pnpm ≥10 ignores builds until approved). Add SSH to a profile the
+    # standard way — `dsh plugin --profile <name> add @linxin666/dsh-ssh` — it
+    # joins the layer stack on its own. The standalone bin still mounts SSH
+    # out of the box (see cordis.yml).
+
+    # The DSHACP app: the widened ACP bridge over the base composition.
+    # Referenced by package name so the installed package resolves; the package
+    # `main`/`exports["."]` points at lib/index.js.
+    - id: dshacp
+      name: '@hanxu131/dshacp'
+      config:
+        # How long a pushed permission request waits for the client before
+        # rejecting (fail-closed).
+        approvalTimeoutMs: 600000
+        # How long an elicitation (ask_user_question) waits for the user before
+        # failing the tool call closed.
+        elicitationTimeoutMs: 1800000
+        # Opt-in hybrid mode: with DSHACP_HYBRID=1 AND a client that advertises
+        # fs.writeTextFile (Zed does), `write` delegates to the client editor.
+        hybridFileWrites: !!js "process.env.DSHACP_HYBRID === '1'"
+
+    # The host-side Cordis plugin runner: provides `dynamicCordisRunner` +
+    # `cordisInspect` for the `cordis` agent preset. Headless-safe.
+    - id: cordis-host-runner
+      name: '@deepseek-ai/dsh-cordis-host-runner'
+
+    # qwenmm vision understanding (qwen-mm-plugins api). `failOnStartupError:
+    # false` keeps the process bootable when uvx / a DashScope key is absent —
+    # the MCP tools simply fail in their card.
+    - id: mcp-qwen-mm-plugins-api
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: qwen-mm-plugins-api
+        transport: stdio
+        command: uvx
+        args:
+          - '--from'
+          - 'qwen-mm-plugins[api] @ git+https://github.com/QwenLM/Qwen-MM-Plugins.git@qwen-mm-plugins-api-v1.0.3'
+          - 'qwen-mm-plugins-api'
+        cwd: !!js process.cwd()
+        failOnStartupError: false
+
+# ── surface-specific values the base deliberately omits ─────────────────────
+
+# DSHACP is headless: stdout is reserved for ACP JSON-RPC, and no HMR exists.
+- id: hmr
+  disabled: true
+
+# The deployment persona (presets shadow it per agent).
+- id: system-prompt
+  config:
+    persona: >-
+      You are a coding assistant powered by the {{model}} model. Your working directory is {{cwd}}. Your bash tool runs under a file sandbox — a `[sandbox: file access denied …]` result is policy, not a command bug.
+
+      Verify your work by running the code or tests. Keep answers brief and factual.
+
+# Sessions persist beside the project (Zed launches from the project root, so
+# `./.sessions` is per-project); DSH_SESSIONS_ROOT overrides.
+- id: session-persistence-jsonl
+  config:
+    root: !!js "process.env.DSH_SESSIONS_ROOT ?? './.sessions'"
+
+# ── the agent plane moves behind agent presets ─────────────────────────────
+#
+# Every row below composes what ONE agent contributes to the host registries.
+# The base keeps them for the single-session TUI; DSHACP disables them here and
+# lets each session mount a preset instead. Host-plane rows that MUST stay
+# host-plane (shell-env, the job/goal/subagent/workflow/tool REGISTRIES,
+# token-meter, tool-subagent-report) are deliberately NOT disabled.
+
+- id: tool-bash
+  disabled: true
+
+- id: tool-pwsh
+  disabled: true
+
+- id: tool-jobs
+  disabled: true
+
+- id: tool-fs
+  disabled: true
+
+- id: tool-fs-search
+  disabled: true
+
+- id: tool-str-replace-editor
+  disabled: true
+
+- id: skill-filesystem
+  disabled: true
+
+- id: tool-skill
+  disabled: true
+
+- id: tool-goal
+  disabled: true
+
+- id: plan-mode
+  disabled: true
+
+- id: compaction-basic
+  disabled: true
+
+- id: command-compact
+  disabled: true
+
+- id: tool-result-pruner
+  disabled: true
+
+- id: tool-subagent-control
+  disabled: true
+
+- id: tool-subagent-list-agents
+  disabled: true
+
+- id: tool-subagent
+  disabled: true
+
+- id: tool-subagent-fork
+  disabled: true
+
+- id: workflow-worker-thread
+  disabled: true
+
+- id: tool-workflow
+  disabled: true
+
+- id: tool-ralph
+  disabled: true
+
+- id: agent-instructions
+  disabled: true
+
+- id: tool-todo
+  disabled: true
+
+- id: tool-web
+  disabled: true

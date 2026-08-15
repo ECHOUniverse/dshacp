@@ -309,7 +309,7 @@ test('ask_user_question elicits through the client (P4b-4)', { skip: !PROMPT_AVA
     assert.equal(request.params.sessionId, created.sessionId)
     assert.equal(request.params.requestedSchema.type, 'object')
     assert.ok(request.params.requestedSchema.properties.q0, 'question mapped to a form property')
-    assert.match(request.params.message, /continue/i, 'message carries the question')
+    assert.match(request.params.message, /continue|继续/i, 'message carries the question')
     // The model must have seen the answer (the tool result feeds the loop).
     const message = await waitFor(() => {
       const byMessage = new Map()
