@@ -60,3 +60,12 @@
     # advertises fs.writeTextFile (Zed does), the `write` tool delegates to
     # the client editor so Zed offers per-hunk diff review.
     hybridFileWrites: !!js "process.env.DSHACP_HYBRID === '1'"
+
+# The host-side Cordis plugin runner: provides `dynamicCordisRunner` +
+# `cordisInspect`, the services the `cordis` agent preset's `tool-cordis`
+# row waits for (创造模式 — read the live runtime, mount a temporary plugin,
+# author presets). It depends only on the host `tools` registry, so it is
+# headless-safe; without it the `cordis` preset fails to mount and the mode
+# is unselectable. The same row the web app mounts.
+- id: cordis-host-runner
+  name: '@deepseek-ai/dsh-cordis-host-runner'

@@ -203,6 +203,20 @@ test('mode switches only a blank session; a started session soft-rejects (D9)', 
   await bridge.client.closeSession({ sessionId: started.sessionId })
 })
 
+test('every shipped mode is selectable on a blank session (cordis needs the host runner)', async () => {
+  for (const mode of ['code', 'minimal', 'cordis']) {
+    const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+    const switched = await bridge.client.setSessionConfigOption({
+      sessionId: created.sessionId,
+      configId: 'mode',
+      value: mode,
+    })
+    assert.equal(switched.configOptions.find(option => option.id === 'mode').currentValue, mode,
+      `mode "${mode}" switches`)
+    await bridge.client.closeSession({ sessionId: created.sessionId })
+  }
+})
+
 test('session creation pushes available_commands_update over userInvocable skills (D10)', async () => {
   const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
   const update = await waitFor(() => bridge.updates.find(update =>

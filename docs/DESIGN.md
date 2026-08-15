@@ -396,6 +396,12 @@ unavailable. Phase 4 replaces that copy with the real thing.
 - **`thought_level` is conditional**: the option is emitted only when the current model
   exposes reasoning efforts (a non-reasoning model gets model + mode only) — Zed renders
   exactly the options it receives, and a selector over a non-existent knob would be noise.
+- **The `cordis` (创造模式) preset needs the host plugin runner**: its `tool-cordis` row
+  injects `dynamicCordisRunner` + `cordisInspect`, which only
+  `@deepseek-ai/dsh-cordis-host-runner` provides. The web app mounts that row; the leaf
+  composition must too, or the preset fails to mount and the mode is unselectable. The
+  runner depends only on the host `tools` registry, so it is headless-safe (the model sees
+  `cordis_inspect_*` / `cordis_define` / `cordis_run` / `cordis_stop` / `cordis_undefine`).
 - **DSH-side MCP (D12 "both")**: the DSH-configured half is ordinary composition — a
   deployment adds `@deepseek-ai/dsh-mcp-client` rows to its own `--config` leaf (the same
   model the web app uses); the Zed-forwarded half is the dynamic `mcpServers` mounting in
