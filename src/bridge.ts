@@ -87,7 +87,6 @@ import {
   toolResultToText,
   turnEndToStopReason,
 } from './codec.ts'
-import { pickDefined } from './options.ts'
 
 export const name = 'dshacp-bridge'
 /** The bridge creates and owns agents; the title service and store serve the wire. */
@@ -306,11 +305,34 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       },
       set current(next) {
         picked = next
+        // Keep the agent's options in lockstep so children spawned after a
+        // dynamic model switch still inherit the parent's current route.
+        syncAgentRoute(record)
       },
       assembled: undefined,
     }
     record.selection = selection
     return selection
+  }
+
+  /**
+   * Mirror the resolved model route onto the live agent's options
+   * (subagent-fix Plan A). Delegation tools inherit provider/model from the
+   * parent's `AgentOptions`, so the pair must track the parent's actual
+   * selection — the config/defaults route for fresh sessions, the persisted
+   * request header restored on resume, and later `model` option switches.
+   * `Agent.options` is typed readonly, but the loop stores the creation
+   * object by reference and reads it at use time (request seed, prompt
+   * variables, child inheritance), so this write-through is effective and
+   * never changes the parent's own routing (`installModelSelection` already
+   * overrides that surface).
+   */
+  const syncAgentRoute = (record: SessionRecord): void => {
+    const selected = selectionFor(record).current
+    if (selected === undefined) return
+    const options = record.agent.options as { provider?: string; model?: string }
+    options.provider = selected.provider
+    options.model = selected.model
   }
 
   /** Whether a session has produced nothing — the only state a mode switch may mutate (D9). */
@@ -842,8 +864,11 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     record.usage.cacheRead += usage.cacheReadTokens ?? 0
     record.usage.cacheWrite += usage.cacheWriteTokens ?? 0
     record.usage.reasoning += usage.reasoningTokens ?? 0
-    // "Tokens currently in context": input + output + cache + thought tokens.
-    const used = record.usage.input + record.usage.output + record.usage.cacheRead + record.usage.cacheWrite + record.usage.reasoning
+    // "Tokens currently in context": input + output + cache-read.
+    // Excludes reasoningTokens (subset of outputTokens) and cacheWriteTokens
+    // (input-side cache-write traffic, not context occupancy) to avoid double
+    // counting — matching the token-meter `usageTokens` convention.
+    const used = record.usage.input + record.usage.output + record.usage.cacheRead
     if (used <= 0) return
     const size = sessionOf(record).requestContext()?.contextWindow ?? 0
     notify({
@@ -1295,9 +1320,30 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     emitSubagentPlan(record, info.provider, String(info.id), 'completed', info.stopReason)
   })
 
-  /** Build per-agent options from bridge config without assigning absent optional fields. */
-  const agentOptions = (): { provider?: string; model?: string } =>
-    pickDefined(config, ['provider', 'model'])
+  /**
+   * Build per-agent options from bridge config, always carrying a concrete
+   * route (subagent-fix Plan A). Delegation inherits provider/model from the
+   * parent's `AgentOptions` (`resolveChildAgentOptions` in dsh-subagent), so
+   * an absent model would fail the child's first prompt assembly (`{{model}}`
+   * has no value). Resolution mirrors `selectionFor`'s chain minus the
+   * request-header leg, which only exists once the session is live: explicit
+   * config wins, then the saved agent-default-model, then the composition
+   * defaults. `syncAgentRoute` refines the pair after adoption (resume
+   * restores the persisted header).
+   */
+  const agentOptions = (): { provider: string; model: string } => {
+    if (config.provider !== undefined || config.model !== undefined) {
+      return {
+        provider: config.provider ?? DEFAULT_PROVIDER,
+        model: config.model ?? DEFAULT_MODEL,
+      }
+    }
+    const current = defaultModelService()?.currentSelection()
+    return {
+      provider: current?.provider ?? DEFAULT_PROVIDER,
+      model: current?.model ?? DEFAULT_MODEL,
+    }
+  }
 
   /** The live session behind a bridge record (shortens the common navigation). */
   const sessionOf = (record: SessionRecord): Session => record.agent.session
@@ -1323,6 +1369,10 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   const adoptRecord = (record: SessionRecord): void => {
     installModelSelection(record.agent.ctx, selectionFor(record))
     record.preset = resolveSessionPreset(record.agent.session) ?? presetRoster()?.defaultId
+    // Refine the creation-time route to the resolved selection: for a resumed
+    // session this is the persisted request header's provider/model, which
+    // `agentOptions()` could not know before the agent existed.
+    syncAgentRoute(record)
   }
 
   /** Resume a persisted session into the bridge, rejecting when already open. */
@@ -1331,7 +1381,9 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     if (sessions.has(sessionId)) throw invalidParams(`session is already open: ${sessionId}`)
     const handle = await agents.resume({
       resumeSessionId: sessionId,
-      ...(Object.keys(agentOptions()).length > 0 ? { agentOptions: agentOptions() } : {}),
+      // Always explicit: children inherit the parent's provider/model from
+      // AgentOptions, so the pair must never be left absent (subagent fix).
+      agentOptions: agentOptions(),
       setup: composeSetup(sessionId, cwd),
     })
     if (closed) {
@@ -1481,7 +1533,9 @@ export function apply(ctx: Context, config: BridgeConfig): void {
             cwd: params.cwd,
             ...(presetId !== undefined ? { agentPreset: presetId } : {}),
           },
-          ...(Object.keys(agentOptions()).length > 0 ? { agentOptions: agentOptions() } : {}),
+          // Always explicit: children inherit the parent's provider/model from
+          // AgentOptions, so the pair must never be left absent (subagent fix).
+          agentOptions: agentOptions(),
           setup: composeSetup(sessionId, params.cwd),
         })
         /* v8 ignore next 4 -- a real stdio close can race an in-flight create. */
