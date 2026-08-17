@@ -479,7 +479,9 @@ test('approval bridge: a bash escalation surfaces as request_permission and allo
   assert.ok(completed, 'granted tool call completed')
   const toolCalls = bridge.updates.filter(update =>
     update.kind === 'session_update' && update.tag === 'tool_call' && update.update.toolCallId === toolId)
-  assert.equal(toolCalls[0].update.title, 'bash')
+  assert.match(String(toolCalls[0].update.title), /touch ~\/dshacp-approval-probe/,
+    'execute card title shows the command content, not the bare tool name')
+  assert.notEqual(toolCalls[0].update.title, 'bash')
   assert.equal(toolCalls[0].update.kind, 'execute')
   await bridge.client.closeSession({ sessionId: created.sessionId })
 })

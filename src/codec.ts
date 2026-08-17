@@ -116,6 +116,54 @@ export function toolKindForName(name: string): ToolKind {
 }
 
 /**
+ * Derive a human-readable `tool_call` title for the ACP client.
+ *
+ * ACP's `ToolCall.title` is defined as "what the tool is doing", and Zed
+ * renders it verbatim as the card body for `kind: execute` tools, so pasting
+ * the tool name (`bash`) produces a card that never shows the actual command.
+ * For execute-class tools we therefore use the `command` argument — matching
+ * the DSH harness's own UI presentation (`presentBashCall`: `title: command`)
+ * — and fall back to the tool name when the argument is absent or malformed.
+ *
+ * Non-execute tools keep the current behaviour (title = tool name) untouched.
+ *
+ * @param name - the DSH tool name as the model called it.
+ * @param args - the parsed arguments (`parseToolArguments` output).
+ * @returns the title to send as `tool_call.title`.
+ */
+export function toolTitleForCall(name: string, args: unknown): string {
+  if (toolKindForName(name) !== 'execute') return name
+  const command = extractCommand(args)
+  if (command === undefined) return name
+  const trimmed = command.trim()
+  return trimmed.length > 0 ? truncate(trimmed, EXECUTE_TITLE_MAX_LENGTH) : name
+}
+
+/** Max length of an execute-tool card title before truncation with an ellipsis. */
+const EXECUTE_TITLE_MAX_LENGTH = 80
+
+/**
+ * Pull a command string out of a tool's parsed arguments. Execute-class tools
+ * carry the command text under `command` (bash/terminal) or `cmd`/`command`
+ * (ssh_* family); unknown shapes yield `undefined` so callers fall back.
+ */
+function extractCommand(args: unknown): string | undefined {
+  if (typeof args !== 'object' || args === null) return undefined
+  const record = args as Record<string, unknown>
+  for (const key of ['command', 'cmd']) {
+    const value = record[key]
+    if (typeof value === 'string') return value
+  }
+  return undefined
+}
+
+/** Truncate to `max` runes, appending `…` only when actually cut. */
+function truncate(text: string, max: number): string {
+  if (text.length <= max) return text
+  return text.slice(0, max) + '…'
+}
+
+/**
  * Map DSH todo entries to ACP plan entries. DSH todos carry no priority; the
  * DESIGN fixes `priority` to `medium`. Status passes through unchanged.
  * @param todos - the DSH whole-list snapshot.

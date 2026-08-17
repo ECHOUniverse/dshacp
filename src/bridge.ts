@@ -85,6 +85,7 @@ import {
   todoToPlanEntries,
   toolKindForName,
   toolResultToText,
+  toolTitleForCall,
   turnEndToStopReason,
 } from './codec.ts'
 
@@ -946,15 +947,16 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       }
       case 'tool/call': {
         const { callId, name, arguments: raw } = event.data
+        const parsed = parseToolArguments(raw)
         notify({
           sessionId,
           update: {
             sessionUpdate: 'tool_call',
             toolCallId: callId,
-            title: name,
+            title: toolTitleForCall(name, parsed),
             kind: toolKindForName(name),
             status: 'pending',
-            rawInput: parseToolArguments(raw),
+            rawInput: parsed,
           },
         })
         return
