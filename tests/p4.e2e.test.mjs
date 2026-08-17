@@ -3,7 +3,7 @@
 // like Zed). Prompt tests need a real model credential and skip without one.
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { PROJECT_ROOT, TEST_HOME, TEST_SESSIONS, hasModelCredential, makeTestHome, settledToolCall, spawnBridge, waitFor } from './harness.mjs'
@@ -425,4 +425,138 @@ test('set_config_option responds with the complete option list', async () => {
   assert.ok(after.configOptions.find(option => option.id === 'model'), 'model present in the full list')
   assert.ok(after.configOptions.find(option => option.id === 'mode'), 'mode present in the full list')
   await bridge.client.closeSession({ sessionId: created.sessionId })
+})
+
+// ── Plan A: per-session model/thinking restore (docs/model-thinking-session-restore.md) ──
+
+const currentValue = (options, id) => options.find(option => option.id === id)?.currentValue
+
+/** All `model-selection.json` side-channel files under a sessions root. */
+async function sideChannelFiles(root) {
+  const found = []
+  const walk = async (dir) => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) await walk(path)
+      else if (entry.name === 'model-selection.json') found.push(path)
+    }
+  }
+  await walk(root)
+  return found
+}
+
+test('plan-A side channel restores each session model/thinking (docs §1.1 probes), §7', async () => {
+  // Isolated home + sessions root so the shared harness home (and the machine's
+  // real ~/.dsh) is never mutated, the global default stays deterministic
+  // (flash), and side-channel bookkeeping counts only this test's sessions.
+  const home = join(PROJECT_ROOT, `.test-home-sidechannel-${process.pid}`)
+  const sessionsRoot = join(PROJECT_ROOT, `.test-sessions-sidechannel-${process.pid}`)
+  await rm(home, { recursive: true, force: true })
+  await rm(sessionsRoot, { recursive: true, force: true })
+  await mkdir(home, { recursive: true })
+  await writeFile(join(home, 'settings.yaml'), [
+    'permission:',
+    '  defaultPreset: workspace-write',
+    'agent-default-model:',
+    '  provider: deepseek-official',
+    '  model: deepseek-v4-flash',
+    '',
+  ].join('\n'), 'utf8')
+  const spawned = spawnBridge({ env: { DSH_HOME: home, DSH_SESSIONS_ROOT: sessionsRoot } })
+  try {
+    await waitFor(async () => {
+      try {
+        await spawned.client.initialize({
+          protocolVersion: 1,
+          clientCapabilities: {},
+          clientInfo: { name: 'dshacp-p4-test', version: '0.0.1' },
+        })
+        return true
+      } catch {
+        return false
+      }
+    }, 60000)
+
+    const newSession = () => spawned.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+    const set = (sessionId, configId, value) => spawned.client.setSessionConfigOption({ sessionId, configId, value })
+    const load = async (sessionId) => {
+      const response = await spawned.client.loadSession({ sessionId, cwd: PROJECT_ROOT, mcpServers: [] })
+      return { model: currentValue(response.configOptions, 'model'), thinking: currentValue(response.configOptions, 'thought_level') }
+    }
+    const close = (sessionId) => spawned.client.closeSession({ sessionId })
+
+    // §7 case 5: a session that never switches restores the global default —
+    // regression guard (must run before any switch pollutes the default).
+    const untouched = await newSession()
+    const untouchedFresh = { model: currentValue(untouched.configOptions, 'model'), thinking: currentValue(untouched.configOptions, 'thought_level') }
+    await close(untouched.sessionId)
+    assert.deepEqual(await load(untouched.sessionId), untouchedFresh,
+      'an unswitched session restores the global default')
+
+    // §7 cases 1+6 (probe 2 hardened): A switches pro/high and closes; B
+    // switches flash/off (polluting the global default); loading A must show
+    // A's own pro/high — not B's flash/off.
+    const a = await newSession()
+    await set(a.sessionId, 'model', 'deepseek-official:deepseek-v4-pro')
+    await set(a.sessionId, 'thought_level', 'high')
+    await close(a.sessionId)
+    const b = await newSession()
+    await set(b.sessionId, 'model', 'deepseek-official:deepseek-v4-flash')
+    await set(b.sessionId, 'thought_level', 'off')
+    await close(b.sessionId)
+    assert.deepEqual(await load(a.sessionId),
+      { model: 'deepseek-official:deepseek-v4-pro', thinking: 'high' },
+      'A restores its own pro/high despite B polluting the global default')
+    await close(a.sessionId)
+    assert.deepEqual(await load(b.sessionId),
+      { model: 'deepseek-official:deepseek-v4-flash', thinking: 'off' },
+      'B restores its own flash/off')
+    await close(b.sessionId)
+
+    // §7 case 2: a switch never followed by a request still restores on both
+    // load and resume (distinct from the request/header-only path).
+    const c = await newSession()
+    await set(c.sessionId, 'model', 'deepseek-official:deepseek-v4-pro')
+    await set(c.sessionId, 'thought_level', 'high')
+    await close(c.sessionId)
+    assert.deepEqual(await load(c.sessionId),
+      { model: 'deepseek-official:deepseek-v4-pro', thinking: 'high' },
+      'a switch sent and closed without prompting restores on load')
+    await close(c.sessionId)
+    const resumed = await spawned.client.resumeSession({ sessionId: c.sessionId, cwd: PROJECT_ROOT })
+    assert.equal(currentValue(resumed.configOptions, 'model'), 'deepseek-official:deepseek-v4-pro',
+      'resume restores the session model')
+    assert.equal(currentValue(resumed.configOptions, 'thought_level'), 'high',
+      'resume restores the session thinking')
+    await close(c.sessionId)
+
+    // §7 case 3: a thinking-only switch restores, with the model as chosen.
+    const d = await newSession()
+    await set(d.sessionId, 'model', 'deepseek-official:deepseek-v4-flash')
+    await set(d.sessionId, 'thought_level', 'max')
+    await close(d.sessionId)
+    assert.deepEqual(await load(d.sessionId),
+      { model: 'deepseek-official:deepseek-v4-flash', thinking: 'max' },
+      'a thinking-only switch restores')
+    await close(d.sessionId)
+
+    // §7 case 4: deleting a session removes its side-channel file with the log.
+    const e = await newSession()
+    await set(e.sessionId, 'model', 'deepseek-official:deepseek-v4-pro')
+    await close(e.sessionId)
+    const before = await sideChannelFiles(sessionsRoot)
+    assert.equal(before.length, 5, 'every switched session (a,b,c,d,e) wrote a side-channel file')
+    await spawned.client.deleteSession({ sessionId: e.sessionId })
+    assert.equal((await sideChannelFiles(sessionsRoot)).length, before.length - 1,
+      'deleting a session removes only its own side-channel file')
+    await assert.rejects(
+      spawned.client.loadSession({ sessionId: e.sessionId, cwd: PROJECT_ROOT, mcpServers: [] }),
+      (error) => error.code === -32602 || error.code === -32603,
+      'the deleted session is gone',
+    )
+  } finally {
+    await spawned.stop()
+    await rm(home, { recursive: true, force: true })
+    await rm(sessionsRoot, { recursive: true, force: true })
+  }
 })

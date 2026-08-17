@@ -12,9 +12,10 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { randomUUID } from 'node:crypto'
-import { writeFile } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import Schema from '@deepseek-ai/schemastery'
 import { createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
@@ -111,6 +112,15 @@ export const DEFAULT_BACKGROUND_SETTLE_TIMEOUT_MS = 30 * 60 * 1000
 export const MODEL_OPTION_ID = 'model'
 export const THINKING_OPTION_ID = 'thought_level'
 export const MODE_OPTION_ID = 'mode'
+
+/**
+ * Side-channel file name for the per-session model/thinking record (plan A,
+ * session restore): the session's own last-chosen selection, stored as a
+ * sibling of its durable JSONL log. `request/header` only records a selection
+ * once an LLM request actually fires, so a switch made but never sent would
+ * otherwise be lost — this file restores it on session/load and session/resume.
+ */
+export const SESSION_SELECTION_FILE = 'model-selection.json'
 
 /** Composition-default route, matching the base agent-default-model row. */
 export const DEFAULT_PROVIDER = 'deepseek-official'
@@ -277,6 +287,81 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     })
   }
 
+  /**
+   * Plan A (per-session side channel): the sibling file recording this
+   * session's own last-chosen model/thinking, next to its durable JSONL log —
+   * `dirname(locate(session.header).path)/model-selection.json`. `locate` is
+   * pure path computation (no I/O), so an absent backend, an absent `locate`,
+   * or an unmaterialized session all resolve as "no path" — the deployment
+   * then simply has no per-session restore (matching `deletePersisted`).
+   */
+  const sessionSelectionPath = (record: SessionRecord): string | undefined => {
+    const persistence = ctx.get('sessionPersistence')
+    if (persistence === undefined || typeof persistence.locate !== 'function') return undefined
+    const location = persistence.locate(sessionOf(record).header)
+    if (location === undefined) return undefined
+    return join(dirname(location.path), SESSION_SELECTION_FILE)
+  }
+
+  /**
+   * Read this session's own last-chosen model/thinking (plan-A restore).
+   * Best effort: an absent file reads as no record and the chain falls through
+   * to the request header / deployment default; a malformed file is ignored
+   * with a warning, never a thrown error.
+   */
+  const readSessionSelection = (record: SessionRecord): ModelSelection | undefined => {
+    const path = sessionSelectionPath(record)
+    if (path === undefined) return undefined
+    let raw: string
+    try {
+      raw = readFileSync(path, 'utf8')
+    } catch (error: unknown) {
+      const code = (error as { code?: string }).code
+      if (code !== 'ENOENT') logger.warn(`dshacp: reading the session model selection failed: ${String(error)}`)
+      return undefined
+    }
+    try {
+      const parsed = JSON.parse(raw) as Partial<ModelSelection>
+      if (typeof parsed.provider !== 'string' || typeof parsed.model !== 'string') return undefined
+      return {
+        provider: parsed.provider,
+        model: parsed.model,
+        ...(typeof parsed.reasoningEffort === 'string'
+          ? { reasoningEffort: parsed.reasoningEffort as ReasoningEffortId }
+          : {}),
+      }
+    } catch (error: unknown) {
+      logger.warn(`dshacp: the session model selection is malformed and ignored: ${String(error)}`)
+      return undefined
+    }
+  }
+
+  /**
+   * Persist the session's own chosen model/thinking to its side-channel file
+   * (plan-A restore): written on every model/thinking switch, so `session/load`
+   * and `session/resume` restore the session's own last choice even when no
+   * request was ever sent. Best effort — a write failure warns and never fails
+   * the switch; the session directory is created on first switch because the
+   * JSONL log is materialized lazily. Runs alongside `persistSelection`, which
+   * keeps serving the independent "remember the last combination for fresh
+   * sessions" feature.
+   */
+  const persistSessionSelection = (record: SessionRecord): void => {
+    const path = sessionSelectionPath(record)
+    if (path === undefined) return
+    const selected = selectionFor(record).current
+    if (selected === undefined) return
+    const payload = JSON.stringify(selected, null, 2)
+    void (async () => {
+      try {
+        await mkdir(dirname(path), { recursive: true })
+        await writeFile(path, payload, 'utf8')
+      } catch (error: unknown) {
+        logger.warn(`dshacp: the model selection applies to this session but was not saved for restore: ${String(error)}`)
+      }
+    })()
+  }
+
   /** The agent-presets roster (base/preset composition), read structurally. */
   const presetRoster = (): AgentPresets | undefined => ctx.get('agentPresets') as AgentPresets | undefined
 
@@ -300,6 +385,15 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     const selection: ModelSelectionRef = {
       get current() {
         if (picked !== undefined) return picked
+        // ① Plan A: this session's own side-channel record. It beats the
+        // request header because a user's most recent switch is newer than the
+        // last actual request — e.g. switch to pro and send, then switch to
+        // flash without sending; restore must show flash. Sessions created
+        // before this file existed fall through unchanged.
+        const stored = readSessionSelection(record)
+        if (stored !== undefined) return stored
+        // ② The last actually-sent request header (backward-compatible restore
+        // for pre-side-channel sessions).
         const logged = record.agent.session.requestHeader()?.config
         if (logged !== undefined) {
           return {
@@ -750,6 +844,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         ...(defaultEffort !== undefined ? { reasoningEffort: ReasoningEffortId(defaultEffort) } : {}),
       }
       persistSelection(record)
+      persistSessionSelection(record)
       return groups
     } else if (params.configId === THINKING_OPTION_ID) {
       const current = selection.current
@@ -769,6 +864,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         reasoningEffort: ReasoningEffortId(params.value),
       }
       persistSelection(record)
+      persistSessionSelection(record)
     } else if (params.configId === MODE_OPTION_ID) {
       const presets = presetRoster()
       if (presets === undefined) throw invalidParams('this deployment composes no agent presets')
@@ -1492,11 +1588,15 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     const location = persistence.locate(header as Parameters<typeof persistence.locate>[0])
     if (location === undefined) return
     const { unlink } = await import('node:fs/promises')
-    try {
-      await unlink(location.path)
-    } catch (error: unknown) {
-      const code = (error as { code?: string }).code
-      if (code !== 'ENOENT') logger.warn(`dshacp: removing persisted session artifact failed: ${String(error)}`)
+    // The plan-A side-channel selection file dies with its session (ENOENT is
+    // ordinary: the session may predate the feature or never be switched).
+    for (const path of [location.path, join(dirname(location.path), SESSION_SELECTION_FILE)]) {
+      try {
+        await unlink(path)
+      } catch (error: unknown) {
+        const code = (error as { code?: string }).code
+        if (code !== 'ENOENT') logger.warn(`dshacp: removing persisted session artifact failed: ${String(error)}`)
+      }
     }
   }
 
