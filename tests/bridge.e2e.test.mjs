@@ -5,7 +5,7 @@ import assert from 'node:assert/strict'
 import { readFile, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { PROJECT_ROOT, TEST_HOME, TEST_SESSIONS, hasModelCredential, makeTestHome, spawnBridge, waitFor } from './harness.mjs'
+import { PROJECT_ROOT, TEST_HOME, TEST_SESSIONS, hasModelCredential, makeTestHome, settledToolCall, spawnBridge, waitFor } from './harness.mjs'
 
 const PROMPT_AVAILABLE = hasModelCredential()
 console.error(`[dshacp e2e] model credential ${PROMPT_AVAILABLE ? 'available' : 'NOT available (prompt tests skipped)'}`)
@@ -281,7 +281,9 @@ test('todo/write maps to plan updates with fixed medium priority', { skip: !PROM
   await bridge.client.closeSession({ sessionId: created.sessionId })
 })
 
-test('workflow runs render as plan updates (P2-1)', { skip: !PROMPT_AVAILABLE }, async () => {
+test('workflow runs render as tool_call cards, not plan updates (P2-1)', { skip: !PROMPT_AVAILABLE }, async () => {
+  // Workflow runtime state belongs to the workflow tool call itself (kind
+  // `other`), not the plan slot: the todo plan must survive a workflow run.
   const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
   const start = bridge.updates.length
   const result = await bridge.client.prompt({
@@ -289,25 +291,36 @@ test('workflow runs render as plan updates (P2-1)', { skip: !PROMPT_AVAILABLE },
     prompt: [{ type: 'text', text: 'Use the workflow tool to run exactly this script and report its result: meta name "wf-test", description "t". Body: phase("setup"); log("hello"); return "ok".' }],
   })
   assert.ok(['end_turn', 'max_tokens'].includes(result.stopReason), `prompt settled: ${result.stopReason}`)
+  const run = await waitFor(() => {
+    const call = bridge.updates.slice(start).find(update =>
+      update.kind === 'session_update' && update.tag === 'tool_call'
+      && update.update.title === 'workflow')
+    if (call === undefined) return undefined
+    // The first tool_call_update is the new in_progress transition; the
+    // settling update is the one carrying the terminal status.
+    const settled = bridge.updates.slice(start).find(update =>
+      update.kind === 'session_update' && update.tag === 'tool_call_update'
+      && update.update.toolCallId === call.update.toolCallId
+      && update.update.status === 'completed')
+    return settled !== undefined ? { call, settled } : undefined
+  })
+  assert.ok(run, 'workflow renders as a tool_call card that settles completed')
+  assert.equal(run.call.update.kind, 'other', 'workflow card kind is `other`')
+  assert.equal(run.settled.update.status, 'completed', 'workflow call settles completed')
   const plans = bridge.updates.slice(start).filter(update =>
     update.kind === 'session_update' && update.tag === 'plan')
-  assert.ok(plans.length >= 2, 'workflow start + end produce plan updates')
-  assert.ok(plans.some(plan => plan.update.entries.some(entry => entry.content.includes('wf-test'))),
-    'plan announces the workflow by name')
-  assert.ok(plans.some(plan => plan.update.entries.some(entry => entry.content.includes('setup'))),
-    'workflow phases appear in the plan')
-  const finalPlan = plans[plans.length - 1].update.entries
-  assert.ok(finalPlan.every(entry => entry.priority === 'medium'), 'plan entries carry medium priority')
+  assert.equal(plans.length, 0, 'a workflow run produces no plan update')
   await bridge.client.closeSession({ sessionId: created.sessionId })
 })
 
-test('a spawned subagent completes and its plan entry settles clean (subagent fix)', { skip: !PROMPT_AVAILABLE }, async () => {
+test('a spawned subagent completes and its tool card settles clean (subagent fix)', { skip: !PROMPT_AVAILABLE }, async () => {
   // Regression for the subagent failure (docs/subagent-failure-fix.md): the
   // child assembles its system prompt from the parent's AgentOptions, so an
   // absent model made every child's first turn fail with
-  // `{{model}} has no value`. A failed child settles with stopReason `error`,
-  // which the bridge annotates on the plan entry as `subagent: spawn (id)
-  // (error)`; a healthy child settles clean.
+  // `{{model}} has no value`. A failed child settles with stopReason `error`; a
+  // healthy child settles clean. The child's lifecycle renders on the
+  // subagent tool_call card (kind `think`) — running then completed — and the
+  // plan slot is left to todo alone.
   const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
   const start = bridge.updates.length
   const result = await bridge.client.prompt({
@@ -315,17 +328,25 @@ test('a spawned subagent completes and its plan entry settles clean (subagent fi
     prompt: [{ type: 'text', text: 'Call the subagent tool exactly once with run_in_background: false, description "regression-test", prompt "Reply with exactly: ok". Wait for it and report the result.' }],
   })
   assert.ok(['end_turn', 'max_tokens'].includes(result.stopReason), `prompt settled: ${result.stopReason}`)
-  // Foreground waits for the child, so its settlement is observable as the
-  // completed subagent/end plan entry (no failure annotation).
-  const end = await waitFor(() => bridge.updates.slice(start).find(update =>
-    update.kind === 'session_update' && update.tag === 'plan'
-    && update.update.entries.some(entry =>
-      entry.status === 'completed' && /^subagent: spawn \([0-9a-f-]+\)$/.test(entry.content))), 120000)
-  assert.ok(end, 'subagent/end settles the child as completed with no failure annotation')
-  const annotated = bridge.updates.slice(start).filter(update =>
-    update.kind === 'session_update' && update.tag === 'plan'
-    && update.update.entries.some(entry => /\(error\)$/.test(entry.content)))
-  assert.equal(annotated.length, 0, 'no plan entry annotates a failed subagent run')
+  // Foreground waits for the child, so its lifecycle is observable on the
+  // card: in_progress while running, then completed with no failure annotation.
+  const run = await waitFor(() => {
+    const call = bridge.updates.slice(start).find(update =>
+      update.kind === 'session_update' && update.tag === 'tool_call'
+      && update.update.title === 'subagent')
+    if (call === undefined) return undefined
+    const states = bridge.updates.slice(start).filter(update =>
+      update.kind === 'session_update' && update.tag === 'tool_call_update'
+      && update.update.toolCallId === call.update.toolCallId).map(update => update.update.status)
+    const completed = states.findIndex(status => status === 'completed')
+    const failed = states.some(status => /^failed/.test(String(status)))
+    return completed !== -1 && !failed ? { call, states, completed } : undefined
+  }, 120000)
+  assert.ok(run, 'subagent card settles completed with no failure annotation')
+  assert.equal(run.call.update.kind, 'think', 'subagent card kind is `think`')
+  const running = run.states.indexOf('in_progress')
+  assert.ok(running !== -1 && running < run.completed,
+    'subagent card flips in_progress before completed')
   await bridge.client.closeSession({ sessionId: created.sessionId })
 })
 
@@ -440,9 +461,7 @@ test('P3 hybrid: a client write refusal surfaces as a tool failure, not a crash'
         && update.update.title === 'write')
       return call?.update.toolCallId
     })
-    const settled = await waitFor(() => hybrid.updates.find(update =>
-      update.kind === 'session_update' && update.tag === 'tool_call_update'
-      && update.update.toolCallId === toolId))
+    const settled = await waitFor(() => settledToolCall(hybrid.updates, toolId))
     assert.match(String(settled.update.rawOutput), /client write failed|refused/i,
       'the refusal is visible in the tool outcome')
     assert.ok(request.params.path.endsWith('.hybrid-fail-test.txt'))
@@ -498,10 +517,10 @@ test('approval bridge: reject-once fails the tool closed', { skip: !PROMPT_AVAIL
     update.kind === 'request_permission' && update.params.sessionId === created.sessionId))
   const toolId = permission.params.toolCall.toolCallId
   // The DSH tool surfaces the rejection as a completed result whose text
-  // reports the refusal (the approval is final — nothing wider ran).
-  const settled = await waitFor(() => bridge.updates.find(update =>
-    update.kind === 'session_update' && update.tag === 'tool_call_update'
-    && update.update.toolCallId === toolId))
+  // reports the refusal (the approval is final — nothing wider ran). The
+  // first tool_call_update is the in_progress transition; wait for the
+  // settling update.
+  const settled = await waitFor(() => settledToolCall(bridge.updates, toolId))
   assert.ok(settled.update.status === 'completed' || settled.update.status === 'failed',
     `rejected call settled as ${settled.update.status}`)
   assert.match(String(settled.update.rawOutput), /reject/i, 'rawOutput reports the rejection')

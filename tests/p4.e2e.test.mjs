@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { PROJECT_ROOT, TEST_HOME, TEST_SESSIONS, hasModelCredential, makeTestHome, spawnBridge, waitFor } from './harness.mjs'
+import { PROJECT_ROOT, TEST_HOME, TEST_SESSIONS, hasModelCredential, makeTestHome, settledToolCall, spawnBridge, waitFor } from './harness.mjs'
 
 // (TEST_HOME comes from the harness; one directory per test-process pid)
 const PROMPT_AVAILABLE = hasModelCredential()
@@ -341,9 +341,9 @@ test('a client without elicitation gets a closed ask_user_question failure', { s
     const call = await waitFor(() => spawned.updates.find(update =>
       update.kind === 'session_update' && update.tag === 'tool_call'
       && update.update.title === 'ask_user_question'))
-    const settled = await waitFor(() => spawned.updates.find(update =>
-      update.kind === 'session_update' && update.tag === 'tool_call_update'
-      && update.update.toolCallId === call.update.toolCallId))
+    // The first tool_call_update is the in_progress transition; the settling
+    // update carries the terminal status and the diagnostic output.
+    const settled = await waitFor(() => settledToolCall(spawned.updates, call.update.toolCallId))
     assert.match(String(settled.update.rawOutput), /CLIENT_UNSUPPORTED|elicitation|unavailable/i,
       'the tool failed closed with an elicitation diagnostic')
     await spawned.client.closeSession({ sessionId: created.sessionId })
@@ -368,9 +368,9 @@ test('MCP forwarding mounts a stdio server whose tools the model can call (D12)'
       update.kind === 'session_update' && update.tag === 'tool_call'
       && update.update.title === 'mcp__fixture__fixture_echo'))
     assert.ok(call, 'the forwarded tool was called by the model')
-    const settled = await waitFor(() => spawned.updates.find(update =>
-      update.kind === 'session_update' && update.tag === 'tool_call_update'
-      && update.update.toolCallId === call.update.toolCallId))
+    // The first tool_call_update is the in_progress transition; the settling
+    // update carries the terminal status and the echoed output.
+    const settled = await waitFor(() => settledToolCall(spawned.updates, call.update.toolCallId))
     assert.match(String(settled.update.rawOutput), /fixture echoed: hello-from-mcp/,
       'the MCP result reached the model')
     await spawned.client.closeSession({ sessionId: created.sessionId })

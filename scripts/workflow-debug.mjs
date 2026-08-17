@@ -1,4 +1,4 @@
-// Debug P2-1: workflow events → plan updates + allow_always.
+// Debug P2-1: workflow tool_call cards (kind `other`, running → completed) + allow_always.
 import { spawn } from 'node:child_process'
 import { Readable, Writable } from 'node:stream'
 import { ClientSideConnection, ndJsonStream } from '@agentclientprotocol/sdk'

@@ -162,3 +162,16 @@ export async function waitFor(predicate, timeoutMs = 30000, intervalMs = 100) {
   }
   throw new Error(`waitFor: condition not met within ${timeoutMs}ms`)
 }
+
+/**
+ * The settling `tool_call_update` for one call: the first update carrying a
+ * terminal status. The first update for a call is now the `in_progress`
+ * transition (bridge `tool/call`), so terminal content (rawOutput) must be
+ * read from this one, not from the first update.
+ */
+export function settledToolCall(updates, toolCallId) {
+  return updates.find(update =>
+    update.kind === 'session_update' && update.tag === 'tool_call_update'
+    && update.update.toolCallId === toolCallId
+    && (update.update.status === 'completed' || update.update.status === 'failed'))
+}

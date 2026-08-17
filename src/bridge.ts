@@ -41,7 +41,6 @@ import {
   type NewSessionResponse,
   type PromptRequest,
   type PromptResponse,
-  type PlanEntryStatus,
   type ResumeSessionRequest,
   type ResumeSessionResponse,
   type SessionConfigOption,
@@ -70,8 +69,6 @@ import { SessionId, type Session, type SessionEvent, type TurnEndReason } from '
 // Side-effect type imports: declaration-merge the event maps answered below.
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-session-title'
-import type {} from '@deepseek-ai/dsh-subagent'
-import type {} from '@deepseek-ai/dsh-workflow'
 // Declaration-merge the `agent-preset/selected` session event (P4b mode switch).
 import type {} from '@deepseek-ai/dsh-agent-presets'
 import { type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval/types'
@@ -117,13 +114,6 @@ export const DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS = 60_000
  * clear error instead of being written to tmp.
  */
 export const MAX_PASTED_IMAGE_BYTES = 25 * 1024 * 1024
-
-/**
- * Fixed plan-entry priority for every mapped update (DESIGN §17): DSH todos
- * carry no priority, so the mapping pins `medium` for todo, workflow, and
- * subagent plans alike.
- */
-export const PLAN_PRIORITY = 'medium' as const
 
 /**
  * The single continuable-subagent teardown the bridge needs. Declared
@@ -195,13 +185,6 @@ interface SessionRecord {
   } | undefined
   /** Tool names the user granted `allow_always`; their calls skip the push. */
   allowedTools: Set<string>
-  /** Live workflow run being rendered as plan updates (P2-1). */
-  workflow: {
-    runId: string
-    name: string
-    phase: string | undefined
-    agents: Map<number, { label: string; phase?: string; status: PlanEntryStatus }>
-  } | undefined
   /** Per-session model selection (P4b): mutated by the `model`/`thought_level` config options. */
   selection: ModelSelectionRef | undefined
   /** The preset id this session runs (P4b): set at setup, updated by mode switches. */
@@ -959,6 +942,18 @@ export function apply(ctx: Context, config: BridgeConfig): void {
             rawInput: parsed,
           },
         })
+        // The tool starts executing right away: flip the card to "running"
+        // (in_progress) so it never sits at pending while it runs — long
+        // calls (e.g. a foreground subagent) show a spinner. Sent in the same
+        // frame, the client processes card-then-transition in order.
+        notify({
+          sessionId,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: callId,
+            status: 'in_progress',
+          },
+        })
         return
       }
       case 'tool/result': {
@@ -1190,151 +1185,6 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   }
 
   /**
-   * Resolve the bridge session a delegated run (workflow/subagent) belongs to
-   * (P2-1). These events carry no agent identity, but a run only executes
-   * while the initiating agent's tool call is in flight. The initiator
-   * boundary is the precise correlation when the event chain still carries
-   * it; otherwise the pending-turn record is the owner — and only when it is
-   * UNIQUE, so concurrent sessions can never misattribute a plan update.
-   */
-  const turnOwner = (): SessionRecord | undefined => {
-    const initiator = agents.currentInitiator()
-    if (initiator !== undefined) {
-      const record = ownedRecord(initiator)
-      if (record !== undefined) return record
-    }
-    const pending = [...sessions.values()].filter(record => record.inflight !== undefined)
-    return pending.length === 1 ? pending[0] : undefined
-  }
-
-  /** Send the workflow state as a whole-plan replacement (DESIGN P2-1). */
-  const emitWorkflowPlan = (record: SessionRecord): void => {
-    const workflow = record.workflow
-    if (workflow === undefined) return
-    const entries: { content: string; priority: typeof PLAN_PRIORITY; status: PlanEntryStatus }[] = []
-    for (const agent of workflow.agents.values()) {
-      entries.push({
-        content: agent.phase !== undefined ? `${agent.label} (${agent.phase})` : agent.label,
-        priority: PLAN_PRIORITY,
-        status: agent.status,
-      })
-    }
-    if (workflow.phase !== undefined) {
-      entries.push({ content: `phase: ${workflow.phase}`, priority: PLAN_PRIORITY, status: 'in_progress' })
-    }
-    if (entries.length === 0) {
-      entries.push({ content: `workflow: ${workflow.name}`, priority: PLAN_PRIORITY, status: 'in_progress' })
-    }
-    notify({
-      sessionId: sessionOf(record).id,
-      update: { sessionUpdate: 'plan', entries },
-    })
-  }
-
-  /**
-   * Resolve the live workflow state for one run event: the owning record must
-   * exist and hold the matching run (a stale event from an older run is
-   * ignored). Shared by every workflow handler.
-   */
-  const workflowOf = (info: { id: unknown }, record: SessionRecord | undefined): SessionRecord | undefined => {
-    if (record === undefined || record.workflow === undefined || record.workflow.runId !== String(info.id)) return undefined
-    return record
-  }
-
-  /** One brief subagent plan entry (P2-1); the stop reason annotates failures. */
-  const emitSubagentPlan = (record: SessionRecord, provider: string, id: string, status: PlanEntryStatus, stopReason?: string): void => {
-    const label = stopReason !== undefined && stopReason !== 'completed'
-      ? `subagent: ${provider} (${id}) (${stopReason})`
-      : `subagent: ${provider} (${id})`
-    notify({
-      sessionId: sessionOf(record).id,
-      update: {
-        sessionUpdate: 'plan',
-        entries: [{ content: label, priority: PLAN_PRIORITY, status }],
-      },
-    })
-  }
-
-  // Workflow runs render as plan updates: phases become progress groups and
-  // each `agent()` call becomes a task entry that settles (completed, with the
-  // outcome annotated) when it ends (P2-1). The last update reports the run's
-  // stop reason.
-  ctx.on('workflow/start', (info) => {
-    const record = turnOwner()
-    if (record === undefined) return
-    record.workflow = {
-      runId: String(info.id),
-      name: info.meta.name,
-      phase: undefined,
-      agents: new Map(),
-    }
-    emitWorkflowPlan(record)
-  })
-
-  ctx.on('workflow/phase', (info, title) => {
-    const record = workflowOf(info, turnOwner())
-    if (record === undefined || record.workflow === undefined) return
-    record.workflow.phase = title
-    emitWorkflowPlan(record)
-  })
-
-  ctx.on('workflow/agent-start', (info, agent) => {
-    const record = workflowOf(info, turnOwner())
-    if (record === undefined || record.workflow === undefined) return
-    record.workflow.agents.set(agent.seq, { label: agent.label, phase: agent.phase, status: 'in_progress' })
-    emitWorkflowPlan(record)
-  })
-
-  ctx.on('workflow/agent-end', (info, agent) => {
-    const record = workflowOf(info, turnOwner())
-    if (record === undefined || record.workflow === undefined) return
-    const entry = record.workflow.agents.get(agent.seq)
-    if (entry !== undefined) {
-      // The call is over whatever its outcome: settle the entry and annotate
-      // a non-clean outcome so the client never sees a spinning task.
-      entry.status = 'completed'
-      if (agent.outcome !== 'completed') entry.label = `${entry.label} (${agent.outcome})`
-    }
-    emitWorkflowPlan(record)
-  })
-
-  ctx.on('workflow/end', (info, result) => {
-    const record = workflowOf(info, turnOwner())
-    if (record === undefined || record.workflow === undefined) return
-    // Any stop reason ends the run: settle the entry and let the content carry
-    // the outcome so the client never sees a spinning task.
-    notify({
-      sessionId: sessionOf(record).id,
-      update: {
-        sessionUpdate: 'plan',
-        entries: [{
-          content: `workflow: ${record.workflow.name} (${result.stopReason})`,
-          priority: PLAN_PRIORITY,
-          status: 'completed',
-        }],
-      },
-    })
-    record.workflow = undefined
-  })
-
-  // Subagent runs render as brief plan updates: the child appears as a task
-  // when it starts and flips to completed when it settles (P2-1). This shares
-  // the single plan slot with todo/workflow updates — the last writer wins.
-  ctx.on('subagent/start', (info) => {
-    const record = turnOwner()
-    if (record === undefined) return
-    emitSubagentPlan(record, info.provider, String(info.id), 'in_progress')
-  })
-
-  ctx.on('subagent/end', (info) => {
-    const record = turnOwner()
-    if (record === undefined) return
-    // Any stop reason ends the run: settle the entry; a non-clean reason is
-    // annotated in the label so the client never sees a spinning task.
-    emitSubagentPlan(record, info.provider, String(info.id), 'completed', info.stopReason)
-  })
-
-  /**
    * Build per-agent options from bridge config, always carrying a concrete
    * route (subagent-fix Plan A). Delegation inherits provider/model from the
    * parent's `AgentOptions` (`resolveChildAgentOptions` in dsh-subagent), so
@@ -1369,7 +1219,6 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     inflight: undefined,
     permission: undefined,
     allowedTools: new Set(),
-    workflow: undefined,
     selection: undefined,
     preset: undefined,
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
