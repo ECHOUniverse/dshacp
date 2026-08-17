@@ -60,6 +60,11 @@
     # advertises fs.writeTextFile (Zed does), the `write` tool delegates to
     # the client editor so Zed offers per-hunk diff review.
     hybridFileWrites: !!js "process.env.DSHACP_HYBRID === '1'"
+    # How long a settled prompt waits for trailing background work (owned bash
+    # / background-subagent jobs) to converge before force-settling. Overridable
+    # by DSHACP_BACKGROUND_SETTLE_MS (used by the e2e timeout test); the schema
+    # default is the 30-minute production cap.
+    backgroundSettleTimeoutMs: !!js "process.env.DSHACP_BACKGROUND_SETTLE_MS ? Number(process.env.DSHACP_BACKGROUND_SETTLE_MS) : 1800000"
 
 # The host-side Cordis plugin runner: provides `dynamicCordisRunner` +
 # `cordisInspect`, the services the `cordis` agent preset's `tool-cordis`

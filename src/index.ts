@@ -66,6 +66,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       'approvalTimeoutMs',
       'elicitationTimeoutMs',
       'hybridFileWrites',
+      'backgroundSettleTimeoutMs',
     ]))
     await transport
     yield transport.dispose

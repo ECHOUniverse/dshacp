@@ -96,6 +96,17 @@ export const DEFAULT_APPROVAL_TIMEOUT_MS = 10 * 60 * 1000
 /** Default user-question (elicitation) timeout: fail-closed after this long (DESIGN P4b). */
 export const DEFAULT_ELICITATION_TIMEOUT_MS = 30 * 60 * 1000
 
+/**
+ * Default cap on how long a settled prompt waits for trailing background work
+ * (owned bash / background-subagent jobs) to converge before force-settling
+ * (prompt-settlement progress note). Same order as the elicitation timeout:
+ * a genuinely-stuck background job must never leave the client without a
+ * response forever, but ordinary long-running background work gets the full
+ * budget. On timeout the prompt settles as if the background were absent —
+ * strictly no worse than the pre-gate behavior.
+ */
+export const DEFAULT_BACKGROUND_SETTLE_TIMEOUT_MS = 30 * 60 * 1000
+
 /** ACP config-option ids for model / thinking / mode (DESIGN §12.4). */
 export const MODEL_OPTION_ID = 'model'
 export const THINKING_OPTION_ID = 'thought_level'
@@ -152,6 +163,14 @@ export interface BridgeConfig {
    * DSH-owned. Default false (opt-in).
    */
   hybridFileWrites?: boolean
+  /**
+   * How long a settled prompt waits for this session's trailing background
+   * work (owned bash / background-subagent jobs) to converge before
+   * force-settling anyway (prompt-settlement progress note). Default
+   * {@link DEFAULT_BACKGROUND_SETTLE_TIMEOUT_MS}. Absent (or a missing
+   * `jobs` service) falls back to the pre-gate settlement on `whenIdle()`.
+   */
+  backgroundSettleTimeoutMs?: number
   /** Runtime-only transport override; production uses stdio. */
   stream?: Stream
 }
@@ -162,6 +181,7 @@ export const Config: Schema<BridgeConfig> = Schema.object({
   approvalTimeoutMs: Schema.natural().default(DEFAULT_APPROVAL_TIMEOUT_MS),
   elicitationTimeoutMs: Schema.natural().default(DEFAULT_ELICITATION_TIMEOUT_MS),
   hybridFileWrites: Schema.boolean().default(false),
+  backgroundSettleTimeoutMs: Schema.natural().default(DEFAULT_BACKGROUND_SETTLE_TIMEOUT_MS),
 })
 
 /** Per-session protocol state. */
@@ -178,6 +198,13 @@ interface SessionRecord {
     /** The correlated turn's ending, set at turn/end and settled at whole-agent idle. */
     endReason: TurnEndReason | undefined
   } | undefined
+  /**
+   * Release the active settle-gate's resources (job observer + fallback timer)
+   * when the inflight is settled out-of-band (cancel/close/delete) — the gate's
+   * own `.then` guard already ignores a stale inflight, but its timer and
+   * `onJobsChanged` listener would otherwise leak until they fire.
+   */
+  settleCleanup: (() => void) | undefined
   /** Pushed permission request awaiting the client; answered `cancelled` on cancel/close. */
   permission: {
     settle: (outcome: ApprovalOutcome) => void
@@ -213,6 +240,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   const sessions = new Map<SessionId, SessionRecord>()
   const approvalTimeoutMs = config.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS
   const elicitationTimeoutMs = config.elicitationTimeoutMs ?? DEFAULT_ELICITATION_TIMEOUT_MS
+  const backgroundSettleTimeoutMs = config.backgroundSettleTimeoutMs ?? DEFAULT_BACKGROUND_SETTLE_TIMEOUT_MS
   let closed = false
   /** Whether the client advertised `fs.writeTextFile` at initialize (P3 gate). */
   let clientFsWrite = false
@@ -359,8 +387,137 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   const settlePrompt = (record: SessionRecord, reason: StopReason): void => {
     const inflight = record.inflight
     if (inflight === undefined) return
+    // Release the settle-gate's timer / job observer so an out-of-band settle
+    // (cancel/close/delete) never leaks them.
+    if (record.settleCleanup !== undefined) {
+      record.settleCleanup()
+      record.settleCleanup = undefined
+    }
     record.inflight = undefined
     inflight.resolve(reason)
+  }
+
+  /**
+   * The subset of the `ctx.jobs` capability (dsh-jobs) the settle gate needs,
+   * declared structurally so this package does not depend on the job seam for
+   * one convergence wait; an absent service means no background-jobs tracking
+   * is possible and the gate passes immediately.
+   */
+  interface JobRegistryView {
+    list(caller?: Agent): readonly { status: string }[]
+    onJobsChanged(listener: (owner: Agent | undefined) => void): () => void
+  }
+
+  /**
+   * Wait until this session's owned background job set holds no job still
+   * converging (`running` / `stopping`). `ctx.jobs` is an optional capability:
+   * a composition without a job service resolves immediately, preserving the
+   * pre-gate behavior. The visible set is re-read on every `onJobsChanged`
+   * edge (registration, stopping transitions, settlement, removal), so a job
+   * registered after the wait starts is still caught. Returns a disposer so an
+   * out-of-band settle (cancel/close/delete) can drop the observer without
+   * waiting for the jobs to converge.
+   * @param record - the live session whose owner bounds job visibility.
+   * @returns `{ wait, dispose }` — `wait` resolves once no owned non-terminal
+   *   job remains (or immediately when no job service is present), and
+   *   `dispose` unsubscribes the observer.
+   */
+  const backgroundIdle = (record: SessionRecord): { wait: Promise<void>; dispose: () => void } => {
+    /* v8 ignore next 4 -- the jobs service is always mounted in the shipped composition. */
+    const jobs = ctx.get('jobs') as JobRegistryView | undefined
+    if (jobs === undefined) {
+      return { wait: Promise.resolve(), dispose: () => {} }
+    }
+    const isTerminal = (status: string): boolean =>
+      status === 'completed' || status === 'killed' || status === 'failed'
+    let settled = false
+    let reader: (() => void) | undefined
+    let resolveWait: () => void
+    const wait = new Promise<void>((resolve) => {
+      resolveWait = resolve
+    })
+    const dispose = (): void => {
+      reader?.()
+      reader = undefined
+    }
+    const check = (): void => {
+      if (settled) return
+      if (jobs.list(record.agent).some(job => !isTerminal(job.status))) return
+      settled = true
+      dispose()
+      resolveWait()
+    }
+    // Subscribe first, then check: a job registered between the initial
+    // `list()` and this `onJobsChanged` registration still holds the gate open
+    // until it settles.
+    reader = jobs.onJobsChanged(() => check())
+    check()
+    return { wait, dispose }
+  }
+
+  /**
+   * Settle one inflight only once the whole-agent is idle AND this session's
+   * trailing background work has converged. The background-convergence wait is
+   * bounded by {@link backgroundSettleTimeoutMs}: the timer starts only once
+   * the whole-agent is idle (so a slow turn is never force-settled mid-call),
+   * and on expiry we settle as if background were absent — strictly no worse
+   * than the pre-gate behavior. The `record.inflight !== inflight` guard keeps
+   * a later cancel/close/delete authoritative.
+   */
+  const settleWhenConverged = (record: SessionRecord, inflight: NonNullable<SessionRecord['inflight']>): void => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let disposeBackground: (() => void) | undefined
+    // One shared teardown so the two cleanup paths (out-of-band settle vs a
+    // settled gate) can never drift apart in what they release.
+    const teardown = (): void => {
+      if (timer !== undefined) clearTimeout(timer)
+      timer = undefined
+      disposeBackground?.()
+      disposeBackground = undefined
+    }
+    const forceSettle = (): void => {
+      if (settled) return
+      settled = true
+      teardown()
+      if (record.inflight !== inflight) return
+      record.settleCleanup = undefined
+      record.inflight = undefined
+      const end = inflight.endReason
+      inflight.resolve(end === undefined ? 'cancelled' : turnEndToStopReason(end))
+    }
+    record.settleCleanup = teardown
+
+    let idle = false
+    let backgroundInactive = false
+    // Settle once whole-agent idle AND no owned background job is converging:
+    // either condition alone still leaves the prompt unsettled. When idle but
+    // background remains, arm the fallback so a stuck job never holds the
+    // response forever.
+    const attemptSettle = (): void => {
+      if (idle && backgroundInactive) return forceSettle()
+      if (idle && !backgroundInactive && timer === undefined) {
+        timer = setTimeout(() => {
+          logger.warn(
+            `dshacp: settling prompt for session ${sessionOf(record).id} after background-settle timeout of ${backgroundSettleTimeoutMs}ms`,
+          )
+          forceSettle()
+        }, backgroundSettleTimeoutMs)
+        timer.unref?.()
+      }
+    }
+    // Condition ① — whole-agent quiescence (the existing settlement signal).
+    void record.agent.whenIdle().then(() => {
+      idle = true
+      attemptSettle()
+    })
+    // Condition ② — this session's owned background jobs converged.
+    const backgroundState = backgroundIdle(record)
+    disposeBackground = () => backgroundState.dispose()
+    void backgroundState.wait.then(() => {
+      backgroundInactive = true
+      attemptSettle()
+    })
   }
 
   const settlePermission = (record: SessionRecord, outcome: ApprovalOutcome): void => {
@@ -1217,6 +1374,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     agent: handle.agent,
     dispose: () => handle.dispose(),
     inflight: undefined,
+    settleCleanup: undefined,
     permission: undefined,
     allowedTools: new Set(),
     selection: undefined,
@@ -1539,16 +1697,15 @@ export function apply(ctx: Context, config: BridgeConfig): void {
             throw internalError(`prompt was not queued: ${detail}`)
           }
           /* v8 ignore stop */
-          // Settlement waits for whole-agent idle: a correlated turn/end arms
-          // `endReason`, while a turnless slot (admission discarded the
-          // prompt) stays cancelled. Other producers may run further turns
-          // before quiescence; the prompt settles only when the agent stops.
-          void record.agent.whenIdle().then(() => {
-            if (record.inflight !== inflight) return
-            record.inflight = undefined
-            const end = inflight.endReason
-            inflight.resolve(end === undefined ? 'cancelled' : turnEndToStopReason(end))
-          })
+          // Settlement waits for whole-agent idle AND this session's trailing
+          // background work (owned bash / background-subagent jobs) to converge:
+          // without the second condition, a prompt whose turn ended but whose
+          // spawned background job still runs would settle `end_turn` early and
+          // Zed's panel would show the conversation ended while the work
+          // continues (prompt-settlement progress note). The gate resolves only
+          // when both hold, or when the background timeout force-settles (a
+          // fallback that is no worse than the pre-gate behavior).
+          settleWhenConverged(record, inflight)
         })
         return { stopReason }
       },
