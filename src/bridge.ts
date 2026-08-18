@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join } from 'node:path'
 import { Readable, Writable } from 'node:stream'
 import Schema from '@deepseek-ai/schemastery'
-import { createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, errorChain, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import {
   AgentSideConnection,
   ndJsonStream,
@@ -135,6 +135,55 @@ export const DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS = 60_000
  * clear error instead of being written to tmp.
  */
 export const MAX_PASTED_IMAGE_BYTES = 25 * 1024 * 1024
+
+/**
+ * The char-per-token heuristic shared with the token-meter surface estimate
+ * (`@deepseek-ai/dsh-token-meter` `CHARS_PER_TOKEN`). Used only by the pi-ai
+ * reasoning fallback ({@link estimateReasoningTokens}).
+ */
+const CHARS_PER_TOKEN = 4
+
+/**
+ * Estimate reasoning tokens from `reasoning` content blocks — the pi-ai
+ * (opencode-go) path fallback. `dsh-llm-pi-ai`'s `mapUsage` drops
+ * `reasoningTokens`, so for that route the thinking text assembled into the
+ * `assistant/message` content is the only available signal; the
+ * deepseek-official (`dsh-llm-deepseek`) path reports exact
+ * `reasoningTokens` and never consults this estimate.
+ *
+ * The estimate matches the token-meter surface heuristic
+ * (`⌈text.length / CHARS_PER_TOKEN⌉` per block, no block overhead), so it
+ * stays on the same scale as the compaction pressure measurement. Thinking
+ * text absent → 0, so non-thinking output counts into `used` in full.
+ * Exported for unit tests; usage accounting lives in `apply`'s
+ * `accumulateUsage`.
+ */
+export const estimateReasoningTokens = (content: readonly ContentBlock[] | undefined): number =>
+  content === undefined
+    ? 0
+    : content.reduce(
+      (total, block) => block.type === 'reasoning' ? total + Math.ceil(block.text.length / CHARS_PER_TOKEN) : total,
+      0,
+    )
+
+/**
+ * The context-occupancy total reported as `usage_update.used`: input +
+ * cache-read + non-reasoning output. `reasoningTokens` is a subset of
+ * `outputTokens` (DeepSeek's `completion_tokens` already includes reasoning)
+ * and its `reasoning_content` does not participate in the next turn's
+ * context (DeepSeek Thinking Mode), so it is subtracted from output — never
+ * merely excluded from the sum. `cacheWriteTokens` is input-side cache-write
+ * traffic, not context occupancy, and is not a DeepSeek wire field; it is
+ * likewise excluded. The clamp keeps a pathological over-report of reasoning
+ * from driving `used` negative. Exported for unit tests (the pi-ai reasoning
+ * fallback itself lives in {@link estimateReasoningTokens}).
+ */
+export const usedTokens = (
+  input: number,
+  cacheRead: number,
+  output: number,
+  reasoning: number,
+): number => input + cacheRead + Math.max(0, output - reasoning)
 
 /**
  * The single continuable-subagent teardown the bridge needs. Declared
@@ -1102,22 +1151,26 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   const accumulateUsage = (
     record: SessionRecord,
     usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number },
+    content?: readonly ContentBlock[],
   ): void => {
     record.usage.input += usage.inputTokens
     record.usage.output += usage.outputTokens
     record.usage.cacheRead += usage.cacheReadTokens ?? 0
     record.usage.cacheWrite += usage.cacheWriteTokens ?? 0
-    record.usage.reasoning += usage.reasoningTokens ?? 0
-    // "Tokens currently in context": input + cache-read + non-reasoning output.
-    // reasoningTokens is a subset of outputTokens (DeepSeek's completion_tokens
-    // already includes reasoning), and reasoning_content does NOT participate in
-    // the next turn's context (DeepSeek Thinking Mode), so it is subtracted out
-    // of output rather than merely "not double-counted". cacheWriteTokens is
-    // input-side cache-write traffic (not a DeepSeek wire field), also excluded.
-    // This matches the token-meter context-occupancy/compaction convention:
-    // reasoning never contributes to context occupancy.
-    const used = record.usage.input + record.usage.cacheRead
-      + Math.max(0, record.usage.output - record.usage.reasoning)
+    // Exact reasoning wins (deepseek-official path); the pi-ai adapter drops
+    // `reasoningTokens`, so the thinking text is estimated as the fallback.
+    // `record.usage.reasoning` therefore accumulates a mix of exact and
+    // estimated values per provider path (see estimateReasoningTokens).
+    record.usage.reasoning += usage.reasoningTokens ?? estimateReasoningTokens(content)
+    // "Tokens currently in context": input + cache-read + non-reasoning output
+    // (see usedTokens for why reasoning is subtracted, not merely excluded,
+    // and why cacheWrite stays out).
+    const used = usedTokens(
+      record.usage.input,
+      record.usage.cacheRead,
+      record.usage.output,
+      record.usage.reasoning,
+    )
     if (used <= 0) return
     const size = sessionOf(record).requestContext()?.contextWindow ?? 0
     notify({
@@ -1178,7 +1231,14 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         return
       }
       case 'assistant/message': {
-        if (event.data.usage !== undefined) accumulateUsage(record, event.data.usage)
+        // The message content is passed alongside usage so the pi-ai path
+        // (opencode-go), whose adapter drops `reasoningTokens`, can still
+        // deduct thinking tokens from `used` via the content's `reasoning`
+        // blocks (see estimateReasoningTokens). The deepseek-official path
+        // ignores the content and uses the exact `reasoningTokens`.
+        if (event.data.usage !== undefined) {
+          accumulateUsage(record, event.data.usage, event.data.message.content)
+        }
         return
       }
       case 'tool/call': {

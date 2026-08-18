@@ -194,6 +194,16 @@ test('session/load replays history after a prompt', { skip: !PROMPT_AVAILABLE },
   const usageSeen = bridge.updates.some(update =>
     update.kind === 'session_update' && update.tag === 'usage_update')
   assert.ok(usageSeen, 'usage_update emitted after a real turn')
+  // The cumulative `used` is a real context-occupancy count: a finite,
+  // non-negative number. Replay below must reproduce it exactly — a live
+  // turn and its replayed log run through the same accumulateUsage path
+  // (including the pi-ai reasoning-text estimate when the adapter reports
+  // no reasoningTokens), so any divergence would mean the accounting is not
+  // deterministic across load.
+  const liveUsed = [...bridge.updates].reverse().find(update =>
+    update.kind === 'session_update' && update.tag === 'usage_update')?.update.used
+  assert.ok(Number.isFinite(liveUsed) && liveUsed >= 0,
+    `live cumulative used is a finite non-negative count: ${liveUsed}`)
   await bridge.client.closeSession({ sessionId: created.sessionId })
 
   // Load into a fresh thread: full replay, including the user prompt and the
@@ -211,6 +221,10 @@ test('session/load replays history after a prompt', { skip: !PROMPT_AVAILABLE },
   assert.ok(replayed.some(update =>
     update.kind === 'session_update' && update.tag === 'usage_update'),
   'replay includes cumulative usage')
+  const replayedUsed = [...replayed].reverse().find(update =>
+    update.kind === 'session_update' && update.tag === 'usage_update')?.update.used
+  assert.equal(replayedUsed, liveUsed,
+    'replay reproduces the identical cumulative used (live == replay accounting)')
   await bridge.client.closeSession({ sessionId: created.sessionId })
 })
 
