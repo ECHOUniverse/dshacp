@@ -1,7 +1,7 @@
 {
   "name": "@hanxu131/dshacp",
   "description": "Zed-first ACP v1 server driving DeepSeek Harness (DSH): standalone stdio bridge with token streaming, tool calls, approval, plan, and session management",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "publishConfig": {
     "access": "public"
   },
