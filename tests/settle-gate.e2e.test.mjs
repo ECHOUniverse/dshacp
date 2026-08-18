@@ -87,6 +87,11 @@ test('session/cancel still settles a prompt cancelled immediately while backgrou
   // gate would otherwise hold the prompt open for a long-running background
   // job, a cancel must return `cancelled` without waiting for the job (or the
   // 30s background-settle timeout).
+  //
+  // The cancel is event-driven rather than timed: it fires the moment the
+  // model's bash tool call appears on the wire (status `in_progress` ⇒ the
+  // background job is starting), so the turn is guaranteed to still be open —
+  // no race with a fast model that ends its turn before a fixed wait elapses.
   const bridge = await initBridge(30_000)
   try {
     const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
@@ -94,9 +99,11 @@ test('session/cancel still settles a prompt cancelled immediately while backgrou
       sessionId: created.sessionId,
       prompt: [{ type: 'text', text: 'Run a bash background job exactly once: `sleep 60` with run_in_background: true. Do NOT wait for it. Then end your turn immediately and say nothing else.' }],
     })
-    // Give the turn a moment to open (and, ideally, start the background job),
-    // then cancel immediately.
-    await new Promise((resolve) => setTimeout(resolve, 2500))
+    // Wait for the model to start the background job (its bash card flips to
+    // in_progress), then cancel immediately while the job is still running.
+    await waitFor(() => bridge.updates.some(update =>
+      update.kind === 'session_update' && update.tag === 'tool_call_update'
+      && update.update.status === 'in_progress'), 20000)
     const started = Date.now()
     await bridge.client.cancel({ sessionId: created.sessionId })
     const result = await prompt
