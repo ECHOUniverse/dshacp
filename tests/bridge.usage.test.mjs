@@ -1,10 +1,11 @@
 // Usage-accounting unit tests (no model, no process). `accumulateUsage`'s two
-// pure seams: `usedTokens` (the context-occupancy total behind `usage_update`
-// — doc: `used = input + cacheRead + (output − reasoning)`) and
-// `estimateReasoningTokens` (the dshacp-only pi-ai / opencode-go fallback,
-// whose adapter `dsh-llm-pi-ai` drops `reasoningTokens`, so the thinking text
-// in the assistant message content is estimated with the token-meter
-// `CHARS_PER_TOKEN = 4` heuristic).
+// pure seams: `usedTokens` (the context-occupancy total behind `usage_update` —
+// a SNAPSHOT of the latest step, `used = input + cacheRead + (output −
+// reasoning)`; cumulative summing across steps would re-count the cached
+// prefix on every request and overflow) and `estimateReasoningTokens` (the
+// dshacp-only pi-ai / opencode-go fallback, whose adapter `dsh-llm-pi-ai`
+// drops `reasoningTokens`, so the thinking text in the assistant message
+// content is estimated with the token-meter `CHARS_PER_TOKEN = 4` heuristic).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { estimateReasoningTokens, usedTokens } from '../lib/bridge.js'

@@ -167,16 +167,21 @@ export const estimateReasoningTokens = (content: readonly ContentBlock[] | undef
     )
 
 /**
- * The context-occupancy total reported as `usage_update.used`: input +
- * cache-read + non-reasoning output. `reasoningTokens` is a subset of
- * `outputTokens` (DeepSeek's `completion_tokens` already includes reasoning)
- * and its `reasoning_content` does not participate in the next turn's
- * context (DeepSeek Thinking Mode), so it is subtracted from output — never
- * merely excluded from the sum. `cacheWriteTokens` is input-side cache-write
- * traffic, not context occupancy, and is not a DeepSeek wire field; it is
- * likewise excluded. The clamp keeps a pathological over-report of reasoning
- * from driving `used` negative. Exported for unit tests (the pi-ai reasoning
- * fallback itself lives in {@link estimateReasoningTokens}).
+ * The context-occupancy total reported as `usage_update.used` — a SNAPSHOT
+ * of one call, not a running sum: `input + cacheRead + non-reasoning output`.
+ * `inputTokens + cacheReadTokens` already equals the full prompt just sent
+ * (input is net of the cache hit, cacheRead restores the hit prefix), so
+ * summing them across steps would count every cached prefix anew; the caller
+ * passes the current step's values to keep the bar at true occupancy.
+ * `reasoningTokens` is a subset of `outputTokens` (DeepSeek's
+ * `completion_tokens` already includes reasoning) and its `reasoning_content`
+ * does not participate in the next turn's context (DeepSeek Thinking Mode),
+ * so it is subtracted from output — never merely excluded from the sum.
+ * `cacheWriteTokens` is input-side cache-write traffic, not context
+ * occupancy, and is not a DeepSeek wire field; it is likewise excluded. The
+ * clamp keeps a pathological over-report of reasoning from driving `used`
+ * negative. Exported for unit tests (the pi-ai reasoning fallback itself
+ * lives in {@link estimateReasoningTokens}).
  */
 export const usedTokens = (
   input: number,
@@ -275,7 +280,11 @@ interface SessionRecord {
   selection: ModelSelectionRef | undefined
   /** The preset id this session runs (P4b): set at setup, updated by mode switches. */
   preset: string | undefined
-  /** Cumulative token accounting for `usage_update` (session-wide). */
+  /**
+   * Session-wide token accounting. The fields accumulate for cost/statistics;
+   * `usage_update.used` is computed per call as a snapshot instead (see
+   * accumulateUsage) so long tool-loops do not re-count cached prefixes.
+   */
   usage: {
     input: number
     output: number
@@ -1147,7 +1156,18 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   // The single UI provider slot belongs to this bridge for the whole process.
   userQuestions.registerProvider({ ask: askViaElicitation })
 
-  /** Accumulate one call's token accounting and report the session-wide total. */
+  /**
+   * Fold one call's token accounting into the session record and report the
+   * current context occupancy as `usage_update.used`.
+   *
+   * The cumulative fields (`record.usage.*`) are kept for cost/statistics, but
+   * `used` is a SNAPSHOT of this call rather than a running total: each step's
+   * `inputTokens + cacheReadTokens` equals the full prompt just sent (the
+   * cached prefix is re-read every step), so summing them across a long
+   * tool-loop turns every cached step into new occupancy and the bar explodes
+   * (observed: a 5-turn / 107-step session reaching 12.3M on a 1M window).
+   * Reporting the latest step keeps the bar at the true context size.
+   */
   const accumulateUsage = (
     record: SessionRecord,
     usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number },
@@ -1161,16 +1181,12 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     // `reasoningTokens`, so the thinking text is estimated as the fallback.
     // `record.usage.reasoning` therefore accumulates a mix of exact and
     // estimated values per provider path (see estimateReasoningTokens).
-    record.usage.reasoning += usage.reasoningTokens ?? estimateReasoningTokens(content)
-    // "Tokens currently in context": input + cache-read + non-reasoning output
-    // (see usedTokens for why reasoning is subtracted, not merely excluded,
-    // and why cacheWrite stays out).
-    const used = usedTokens(
-      record.usage.input,
-      record.usage.cacheRead,
-      record.usage.output,
-      record.usage.reasoning,
-    )
+    const reasoning = usage.reasoningTokens ?? estimateReasoningTokens(content)
+    record.usage.reasoning += reasoning
+    // "Tokens currently in context" (this step's snapshot): input + cache-read
+    // + non-reasoning output — see usedTokens for why reasoning is subtracted,
+    // not merely excluded, and why cacheWrite stays out.
+    const used = usedTokens(usage.inputTokens, usage.cacheReadTokens ?? 0, usage.outputTokens, reasoning)
     if (used <= 0) return
     const size = sessionOf(record).requestContext()?.contextWindow ?? 0
     notify({
