@@ -347,8 +347,10 @@ test('a spawned subagent completes and its tool card settles clean (subagent fix
   const run = await waitFor(() => {
     const call = bridge.updates.slice(start).find(update =>
       update.kind === 'session_update' && update.tag === 'tool_call'
-      && update.update.title === 'subagent')
+      && update.update.title === 'Subagent: regression-test')
     if (call === undefined) return undefined
+    const content = call.update.content
+    if (!Array.isArray(content) || content.length === 0) return undefined
     const states = bridge.updates.slice(start).filter(update =>
       update.kind === 'session_update' && update.tag === 'tool_call_update'
       && update.update.toolCallId === call.update.toolCallId).map(update => update.update.status)
@@ -358,6 +360,7 @@ test('a spawned subagent completes and its tool card settles clean (subagent fix
   }, 120000)
   assert.ok(run, 'subagent card settles completed with no failure annotation')
   assert.equal(run.call.update.kind, 'think', 'subagent card kind is `think`')
+  assert.match(String(run.call.update.content?.[0]?.content?.text ?? ''), /Task: regression-test/)
   const running = run.states.indexOf('in_progress')
   assert.ok(running !== -1 && running < run.completed,
     'subagent card flips in_progress before completed')

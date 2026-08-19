@@ -72,18 +72,26 @@ import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-session-title'
 // Declaration-merge the `agent-preset/selected` session event (P4b mode switch).
 import type {} from '@deepseek-ai/dsh-agent-presets'
+// Declaration-merge subagent lifecycle events observed by the bridge.
+import type {} from '@deepseek-ai/dsh-subagent'
 import { type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval/types'
 import {
   acpPromptToText,
   callTimeDiffsForTool,
+  contentBlocksToText,
   encodeModelOption,
   fileDiffsToAcpContent,
   imageExtensionForMime,
+  isSubagentDelegationTool,
   locationsFromDiffs,
   parseModelOption,
+  parseSubagentLaunch,
   parseToolArguments,
   promptHasUnsupportedContent,
   resultDiffsForTool,
+  subagentCardText,
+  subagentNotificationSource,
+  textToToolCallContent,
   todoToPlanEntries,
   toolKindForName,
   toolResultToText,
@@ -203,6 +211,24 @@ interface ContinuableDrain {
   drainContinuableDescendants(parents: readonly Agent[]): Promise<void>
 }
 
+/**
+ * Minimal subagent registry surface for correlating lifecycle events with the
+ * parent ACP session without importing the full seam.
+ */
+interface SubagentRegistryView {
+  listChildren(parentSessionId: SessionId): Promise<readonly { kind: string; id: SessionId }[]>
+}
+
+/** Live state for one open subagent delegation card in an ACP session. */
+interface OpenSubagentCard {
+  toolName: string
+  args: unknown
+  childId?: string
+  jobId?: string
+  background: boolean
+  text: string
+}
+
 /** Preserve invalid-parameter detail in the SDK wire error message. */
 function invalidParams(detail: string): RequestError {
   return RequestError.invalidParams(undefined, detail)
@@ -298,6 +324,8 @@ interface SessionRecord {
   }
   /** Pending tool calls keyed by callId — args retained for result-time diff mapping. */
   pendingToolCalls: Map<string, { name: string; args: unknown }>
+  /** Open subagent delegation cards keyed by parent tool call id. */
+  openSubagents: Map<string, OpenSubagentCard>
 }
 
 /**
@@ -540,6 +568,74 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     void conn.sessionUpdate(notification).catch((error: unknown) => {
       logger.warn(`dshacp: session/update failed: ${String(error)}`)
     })
+  }
+
+  /** Find an open delegation card already bound to a child session id. */
+  const findCardByChildId = (childId: string): { record: SessionRecord; toolCallId: string } | undefined => {
+    for (const record of sessions.values()) {
+      for (const [toolCallId, entry] of record.openSubagents) {
+        if (entry.childId === childId) return { record, toolCallId }
+      }
+    }
+    return undefined
+  }
+
+  /** Patch one delegation card's replaceable body and optional terminal status. */
+  const patchDelegationCard = (
+    record: SessionRecord,
+    toolCallId: string,
+    patch: { text?: string; status?: 'in_progress' | 'completed' | 'failed'; finalize?: boolean },
+  ): void => {
+    const entry = record.openSubagents.get(toolCallId)
+    if (entry === undefined) return
+    if (patch.text !== undefined) entry.text = patch.text
+    notify({
+      sessionId: sessionOf(record).id,
+      update: {
+        sessionUpdate: 'tool_call_update',
+        toolCallId,
+        ...(patch.text !== undefined ? { content: textToToolCallContent(entry.text) } : {}),
+        ...(patch.status !== undefined ? { status: patch.status } : {}),
+      },
+    })
+    if (patch.finalize === true) record.openSubagents.delete(toolCallId)
+  }
+
+  /**
+   * Resolve which parent-session delegation card a child lifecycle event belongs
+   * to — prefer an explicit child binding, else a single unbound card on the
+   * owning parent session.
+   */
+  const resolveDelegationBinding = async (
+    childId: SessionId,
+  ): Promise<{ record: SessionRecord; toolCallId: string; entry: OpenSubagentCard } | undefined> => {
+    const bound = findCardByChildId(childId)
+    if (bound !== undefined) {
+      const entry = bound.record.openSubagents.get(bound.toolCallId)
+      if (entry !== undefined) return { ...bound, entry }
+    }
+
+    const subagents = ctx.get('subagents') as SubagentRegistryView | undefined
+    if (subagents === undefined) return undefined
+
+    for (const record of sessions.values()) {
+      let ownsChild = false
+      try {
+        const children = await subagents.listChildren(sessionOf(record).id)
+        ownsChild = children.some(entry => entry.kind === 'child' && entry.id === childId)
+      } catch (error: unknown) {
+        logger.warn(`dshacp: listChildren failed: ${String(error)}`)
+        continue
+      }
+      if (!ownsChild) continue
+
+      const unbound = [...record.openSubagents.entries()].filter(([, entry]) => entry.childId === undefined)
+      if (unbound.length === 1) {
+        const [toolCallId, entry] = unbound[0]!
+        return { record, toolCallId, entry }
+      }
+    }
+    return undefined
   }
 
   const settlePrompt = (record: SessionRecord, reason: StopReason): void => {
@@ -1213,6 +1309,31 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     const sessionId = sessionOf(record).id
     switch (event.type) {
       case 'user/message': {
+        const notification = subagentNotificationSource(event.data.source)
+        if (notification !== undefined && !replay) {
+          const binding = findCardByChildId(notification.senderSessionId)
+          if (binding !== undefined) {
+            const entry = binding.record.openSubagents.get(binding.toolCallId)
+            if (entry !== undefined) {
+              const notificationText = contentBlocksToText(event.data.content)
+              entry.text = subagentCardText({
+                toolName: entry.toolName,
+                args: entry.args,
+                phase: notification.kind === 'report' ? 'report' : 'settled',
+                childId: notification.senderSessionId,
+                notification: notificationText,
+                ...(notification.kind === 'settled' ? { stopReason: 'completed' } : {}),
+              })
+              patchDelegationCard(binding.record, binding.toolCallId, {
+                text: entry.text,
+                ...(notification.kind === 'settled' && entry.background
+                  ? { status: 'completed', finalize: true }
+                  : {}),
+              })
+            }
+          }
+          return
+        }
         if (!replay || event.data.source.kind !== 'user') return
         for (const block of event.data.content) {
           if (block.type === 'text' && block.text.length > 0) {
@@ -1269,8 +1390,20 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         record.pendingToolCalls.set(String(callId), { name, args: parsed })
         const cwd = sessionOf(record).header.cwd
         const callDiffs = callTimeDiffsForTool(name, parsed)
-        const callContent = callDiffs !== undefined ? fileDiffsToAcpContent(callDiffs, cwd) : undefined
+        let callContent = callDiffs !== undefined ? fileDiffsToAcpContent(callDiffs, cwd) : undefined
         const callLocations = callDiffs !== undefined ? locationsFromDiffs(callDiffs, cwd) : undefined
+        if (isSubagentDelegationTool(name)) {
+          const cardText = subagentCardText({ toolName: name, args: parsed, phase: 'call' })
+          record.openSubagents.set(String(callId), {
+            toolName: name,
+            args: parsed,
+            background: typeof parsed === 'object'
+              && parsed !== null
+              && (parsed as Record<string, unknown>).run_in_background === true,
+            text: cardText,
+          })
+          callContent = textToToolCallContent(cardText)
+        }
         notify({
           sessionId,
           update: {
@@ -1306,6 +1439,61 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         record.pendingToolCalls.delete(String(toolCallId))
         const cwd = sessionOf(record).header.cwd
         const failed = error !== undefined
+        const resultText = toolResultToText(message.content, error)
+
+        if (pending !== undefined && isSubagentDelegationTool(pending.name)) {
+          const entry = record.openSubagents.get(String(toolCallId))
+          const launch = !failed ? parseSubagentLaunch(resultText) : undefined
+          if (launch !== undefined && entry !== undefined) {
+            entry.background = true
+            if (launch.kind === 'continuable') entry.childId = launch.id
+            else entry.jobId = launch.id
+            entry.text = subagentCardText({
+              toolName: pending.name,
+              args: pending.args,
+              phase: 'launched',
+              childId: entry.childId,
+              jobId: entry.jobId,
+              resultText,
+            })
+            notify({
+              sessionId,
+              update: {
+                sessionUpdate: 'tool_call_update',
+                toolCallId,
+                status: 'in_progress',
+                content: textToToolCallContent(entry.text),
+                rawOutput: resultText,
+              },
+            })
+            return
+          }
+
+          if (entry !== undefined) {
+            entry.text = subagentCardText({
+              toolName: pending.name,
+              args: pending.args,
+              phase: failed ? 'failed' : 'result',
+              childId: entry.childId,
+              jobId: entry.jobId,
+              resultText,
+              stopReason: failed ? 'error' : undefined,
+            })
+            record.openSubagents.delete(String(toolCallId))
+          }
+          notify({
+            sessionId,
+            update: {
+              sessionUpdate: 'tool_call_update',
+              toolCallId,
+              status: failed ? 'failed' : 'completed',
+              content: textToToolCallContent(entry?.text ?? resultText),
+              rawOutput: resultText,
+            },
+          })
+          return
+        }
+
         const resultDiffs = !failed && pending !== undefined
           ? resultDiffsForTool(pending.name, pending.args, meta)
           : undefined
@@ -1364,6 +1552,54 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         }
       }
     }
+  })
+
+  ctx.on('subagent/start', (info) => {
+    void resolveDelegationBinding(info.id).then((binding) => {
+      if (binding === undefined) return
+      binding.entry.childId = info.id
+      binding.entry.text = subagentCardText({
+        toolName: binding.entry.toolName,
+        args: binding.entry.args,
+        phase: 'running',
+        childId: info.id,
+      })
+      patchDelegationCard(binding.record, binding.toolCallId, { text: binding.entry.text })
+    }).catch((error: unknown) => {
+      logger.warn(`dshacp: subagent/start card patch failed: ${String(error)}`)
+    })
+  })
+
+  ctx.on('subagent/end', (info) => {
+    const binding = findCardByChildId(info.id)
+    if (binding === undefined) return
+    const entry = binding.record.openSubagents.get(binding.toolCallId)
+    if (entry === undefined) return
+
+    const closing = info.lastAssistantMessage !== undefined
+      ? contentBlocksToText(info.lastAssistantMessage)
+      : undefined
+    const failed = info.stopReason !== 'completed'
+    entry.text = subagentCardText({
+      toolName: entry.toolName,
+      args: entry.args,
+      phase: failed ? 'failed' : 'settled',
+      childId: info.id,
+      jobId: entry.jobId,
+      stopReason: String(info.stopReason),
+      closing,
+    })
+
+    if (entry.background) {
+      patchDelegationCard(binding.record, binding.toolCallId, {
+        text: entry.text,
+        status: failed ? 'failed' : 'completed',
+        finalize: true,
+      })
+      return
+    }
+
+    patchDelegationCard(binding.record, binding.toolCallId, { text: entry.text })
   })
 
   ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
@@ -1580,6 +1816,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     preset: undefined,
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
     pendingToolCalls: new Map(),
+    openSubagents: new Map(),
   })
 
   /** ISO timestamp of the log's last event, or null for an empty log. */

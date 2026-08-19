@@ -140,7 +140,8 @@ export function toolKindForName(name: string): ToolKind {
  * the DSH harness's own UI presentation (`presentBashCall`: `title: command`)
  * — and fall back to the tool name when the argument is absent or malformed.
  *
- * Non-execute tools keep the current behaviour (title = tool name) untouched.
+ * Delegation and control tools use their model-facing arguments; other
+ * non-execute tools keep the tool name.
  *
  * @param name - the DSH tool name as the model called it.
  * @param args - the parsed arguments (`parseToolArguments` output).
@@ -156,6 +157,30 @@ export function toolTitleForCall(name: string, args: unknown): string {
     const path = extractFilePath(args)
     return path !== undefined ? `Edit ${truncate(path, EDIT_TITLE_MAX_LENGTH)}` : name
   }
+  if (n === 'subagent') {
+    const description = extractStringField(args, 'description')
+    return description !== undefined
+      ? truncate(`Subagent: ${description}`, SUBAGENT_TITLE_MAX_LENGTH)
+      : name
+  }
+  if (n === 'subagent_fork') {
+    const description = extractStringField(args, 'description')
+    return description !== undefined
+      ? truncate(`Subagent fork: ${description}`, SUBAGENT_TITLE_MAX_LENGTH)
+      : name
+  }
+  if (n === 'ralph') {
+    const description = extractStringField(args, 'description')
+    return description !== undefined
+      ? truncate(`Ralph: ${description}`, SUBAGENT_TITLE_MAX_LENGTH)
+      : name
+  }
+  if (n === 'send_message') {
+    const target = extractStringField(args, 'subagent_id') ?? extractStringField(args, 'agent_id')
+    return target !== undefined
+      ? truncate(`Send to ${target}`, SUBAGENT_TITLE_MAX_LENGTH)
+      : name
+  }
   if (toolKindForName(name) !== 'execute') return name
   const command = extractCommand(args)
   if (command === undefined) return name
@@ -168,6 +193,180 @@ const EXECUTE_TITLE_MAX_LENGTH = 80
 
 /** Max length of a write/edit card title path segment before truncation. */
 const EDIT_TITLE_MAX_LENGTH = 80
+
+/** Max length of a delegation-tool card title before truncation. */
+const SUBAGENT_TITLE_MAX_LENGTH = 80
+
+/** Max prompt excerpt shown on a subagent card body. */
+const SUBAGENT_PROMPT_MAX_LENGTH = 200
+
+/** Max body text appended to a subagent card (results, notifications). */
+const SUBAGENT_BODY_MAX_LENGTH = 1200
+
+/** Whether a tool name is a provider-bound subagent delegation tool. */
+export function isSubagentDelegationTool(name: string): boolean {
+  const n = name.toLowerCase()
+  return n === 'subagent' || n === 'subagent_fork'
+}
+
+/** Parsed background launch confirmation from a delegation tool result. */
+export interface SubagentLaunchInfo {
+  kind: 'continuable' | 'background'
+  id: string
+}
+
+const CONTINUABLE_LAUNCH_RE = /^started subagent (\S+)$/
+const BACKGROUND_JOB_LAUNCH_RE = /^started background subagent job (\S+)$/
+
+/**
+ * Recognize the canonical one-line launch confirmations from
+ * `@deepseek-ai/dsh-tool-subagent`.
+ * @param resultText - rendered tool result text.
+ * @returns launch kind and id, or `undefined` when not a launch line.
+ */
+export function parseSubagentLaunch(resultText: string): SubagentLaunchInfo | undefined {
+  const trimmed = resultText.trim()
+  const continuable = CONTINUABLE_LAUNCH_RE.exec(trimmed)
+  if (continuable !== null) return { kind: 'continuable', id: continuable[1]! }
+  const background = BACKGROUND_JOB_LAUNCH_RE.exec(trimmed)
+  if (background !== null) return { kind: 'background', id: background[1]! }
+  return undefined
+}
+
+/** Inputs for rendering one replaceable subagent card body. */
+export interface SubagentCardInput {
+  toolName: string
+  args: unknown
+  phase: 'call' | 'running' | 'launched' | 'report' | 'settled' | 'failed' | 'result'
+  childId?: string
+  jobId?: string
+  resultText?: string
+  stopReason?: string
+  closing?: string
+  notification?: string
+}
+
+/**
+ * Build the full replaceable text body for a subagent delegation card.
+ * @param input - card phase and optional lifecycle details.
+ * @returns multi-line card text for ACP `tool_call.content`.
+ */
+export function subagentCardText(input: SubagentCardInput): string {
+  const lines: string[] = []
+  const description = extractStringField(input.args, 'description')
+  const prompt = extractStringField(input.args, 'prompt')
+  const background = extractBooleanField(input.args, 'run_in_background') === true
+
+  if (description !== undefined) lines.push(`Task: ${description}`)
+  if (prompt !== undefined) lines.push(`Prompt: ${truncate(prompt, SUBAGENT_PROMPT_MAX_LENGTH)}`)
+
+  if (input.phase === 'call') {
+    lines.push(background ? 'Mode: background' : 'Mode: foreground')
+    return lines.join('\n')
+  }
+
+  if (input.childId !== undefined) lines.push(`Child: ${input.childId}`)
+  if (input.jobId !== undefined) lines.push(`Job: ${input.jobId}`)
+
+  switch (input.phase) {
+    case 'running':
+      lines.push('Status: running')
+      break
+    case 'launched':
+      lines.push('Status: started in background')
+      if (input.resultText !== undefined) lines.push(input.resultText)
+      break
+    case 'report':
+      lines.push('Status: report received')
+      if (input.notification !== undefined) {
+        lines.push(truncate(input.notification, SUBAGENT_BODY_MAX_LENGTH))
+      }
+      break
+    case 'settled':
+      lines.push(`Status: finished (${input.stopReason ?? 'completed'})`)
+      if (input.closing !== undefined && input.closing.length > 0) {
+        lines.push('Closing message:')
+        lines.push(truncate(input.closing, SUBAGENT_BODY_MAX_LENGTH))
+      }
+      break
+    case 'failed':
+      lines.push(`Status: failed (${input.stopReason ?? 'error'})`)
+      if (input.closing !== undefined && input.closing.length > 0) {
+        lines.push('Partial output:')
+        lines.push(truncate(input.closing, SUBAGENT_BODY_MAX_LENGTH))
+      }
+      break
+    case 'result':
+      lines.push('Status: completed')
+      if (input.resultText !== undefined) {
+        lines.push('Result:')
+        lines.push(truncate(input.resultText, SUBAGENT_BODY_MAX_LENGTH))
+      }
+      break
+  }
+
+  return lines.join('\n')
+}
+
+/**
+ * Wrap plain text as a single ACP v1 tool-call content block.
+ * @param text - card body text.
+ * @returns one `content` item suitable for `tool_call.content`.
+ */
+export function textToToolCallContent(text: string): ToolCallContent[] {
+  return [{ type: 'content', content: { type: 'text', text } }]
+}
+
+/**
+ * Flatten LLM content blocks to plain text for card bodies.
+ * @param blocks - message or tool content blocks.
+ * @returns concatenated text blocks, or an empty string.
+ */
+export function contentBlocksToText(
+  blocks: readonly { type: string; text?: string }[],
+): string {
+  const parts: string[] = []
+  for (const block of blocks) {
+    if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
+      parts.push(block.text)
+    }
+  }
+  return parts.join('\n')
+}
+
+/**
+ * Detect subagent report/settlement injections that should patch a delegation
+ * card instead of appearing in the main conversation stream.
+ * @param source - durable message source from a `user/message` event.
+ * @returns notification kind and child session id, or `undefined`.
+ */
+export function subagentNotificationSource(
+  source: unknown,
+): { kind: 'report' | 'settled'; senderSessionId: string } | undefined {
+  if (typeof source !== 'object' || source === null) return undefined
+  const record = source as Record<string, unknown>
+  const senderSessionId = record.senderSessionId
+  if (typeof senderSessionId !== 'string' || senderSessionId.length === 0) return undefined
+  if (record.kind === 'subagent-report') return { kind: 'report', senderSessionId }
+  if (record.kind === 'subagent-settled') return { kind: 'settled', senderSessionId }
+  return undefined
+}
+
+/** Pull a non-empty string field from parsed tool arguments. */
+function extractStringField(args: unknown, key: string): string | undefined {
+  if (typeof args !== 'object' || args === null) return undefined
+  const value = (args as Record<string, unknown>)[key]
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
+
+/** Pull a boolean field from parsed tool arguments. */
+function extractBooleanField(args: unknown, key: string): boolean | undefined {
+  if (typeof args !== 'object' || args === null) return undefined
+  const value = (args as Record<string, unknown>)[key]
+  return typeof value === 'boolean' ? value : undefined
+}
 
 /**
  * Pull a command string out of a tool's parsed arguments. Execute-class tools
