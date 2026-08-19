@@ -440,6 +440,35 @@ test('P3 hybrid: write delegates to the client when it advertises fs.writeTextFi
   }
 })
 
+test('write tool result renders as ACP diff content, not model XML', { skip: !PROMPT_AVAILABLE }, async () => {
+  const target = join(PROJECT_ROOT, '.acp-write-diff-test.txt')
+  await rm(target, { force: true })
+  try {
+    const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+    const result = await bridge.client.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'Use the write tool to create the file .acp-write-diff-test.txt with exactly this content: diff hello' }],
+    })
+    assert.ok(['end_turn', 'max_tokens'].includes(result.stopReason), `prompt settled: ${result.stopReason}`)
+    const writeCall = bridge.updates.find(update =>
+      update.kind === 'session_update' && update.tag === 'tool_call'
+      && update.update.title?.startsWith('Write'))
+    assert.ok(writeCall, 'write tool_call card created with Write title')
+    const settled = settledToolCall(bridge.updates, writeCall.update.toolCallId)
+    assert.ok(settled, 'write tool_call_update settled')
+    assert.equal(settled.update.status, 'completed')
+    assert.ok(Array.isArray(settled.update.content) && settled.update.content.length > 0,
+      'completed write carries content blocks')
+    assert.equal(settled.update.content[0].type, 'diff')
+    assert.ok(settled.update.content[0].path.endsWith('.acp-write-diff-test.txt'))
+    assert.match(settled.update.content[0].newText, /diff hello/)
+    assert.equal(settled.update.rawOutput, undefined, 'successful diff omits model-facing rawOutput')
+    await bridge.client.closeSession({ sessionId: created.sessionId })
+  } finally {
+    await rm(target, { force: true })
+  }
+})
+
 test('P3 hybrid: a client write refusal surfaces as a tool failure, not a crash', { skip: !PROMPT_AVAILABLE }, async () => {
   const hybrid = spawnBridge({
     env: { DSHACP_HYBRID: '1' },

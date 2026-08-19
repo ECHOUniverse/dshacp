@@ -75,11 +75,15 @@ import type {} from '@deepseek-ai/dsh-agent-presets'
 import { type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval/types'
 import {
   acpPromptToText,
+  callTimeDiffsForTool,
   encodeModelOption,
+  fileDiffsToAcpContent,
   imageExtensionForMime,
+  locationsFromDiffs,
   parseModelOption,
   parseToolArguments,
   promptHasUnsupportedContent,
+  resultDiffsForTool,
   todoToPlanEntries,
   toolKindForName,
   toolResultToText,
@@ -292,6 +296,8 @@ interface SessionRecord {
     cacheWrite: number
     reasoning: number
   }
+  /** Pending tool calls keyed by callId — args retained for result-time diff mapping. */
+  pendingToolCalls: Map<string, { name: string; args: unknown }>
 }
 
 /**
@@ -1260,6 +1266,11 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       case 'tool/call': {
         const { callId, name, arguments: raw } = event.data
         const parsed = parseToolArguments(raw)
+        record.pendingToolCalls.set(String(callId), { name, args: parsed })
+        const cwd = sessionOf(record).header.cwd
+        const callDiffs = callTimeDiffsForTool(name, parsed)
+        const callContent = callDiffs !== undefined ? fileDiffsToAcpContent(callDiffs, cwd) : undefined
+        const callLocations = callDiffs !== undefined ? locationsFromDiffs(callDiffs, cwd) : undefined
         notify({
           sessionId,
           update: {
@@ -1269,6 +1280,8 @@ export function apply(ctx: Context, config: BridgeConfig): void {
             kind: toolKindForName(name),
             status: 'pending',
             rawInput: parsed,
+            ...(callContent !== undefined && callContent.length > 0 ? { content: callContent } : {}),
+            ...(callLocations !== undefined && callLocations.length > 0 ? { locations: callLocations } : {}),
           },
         })
         // The tool starts executing right away: flip the card to "running"
@@ -1286,16 +1299,30 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         return
       }
       case 'tool/result': {
-        const { message, error } = event.data
+        const { message, error, meta } = event.data
         const toolCallId = message.content[0]?.toolCallId
         if (toolCallId === undefined) return
+        const pending = record.pendingToolCalls.get(String(toolCallId))
+        record.pendingToolCalls.delete(String(toolCallId))
+        const cwd = sessionOf(record).header.cwd
+        const failed = error !== undefined
+        const resultDiffs = !failed && pending !== undefined
+          ? resultDiffsForTool(pending.name, pending.args, meta)
+          : undefined
+        const resultContent = resultDiffs !== undefined ? fileDiffsToAcpContent(resultDiffs, cwd) : undefined
+        const resultLocations = resultDiffs !== undefined ? locationsFromDiffs(resultDiffs, cwd) : undefined
+        const hasDiffContent = resultContent !== undefined && resultContent.length > 0
         notify({
           sessionId,
           update: {
             sessionUpdate: 'tool_call_update',
             toolCallId,
-            status: error !== undefined ? 'failed' : 'completed',
-            rawOutput: toolResultToText(message.content, error),
+            status: failed ? 'failed' : 'completed',
+            ...(hasDiffContent ? { content: resultContent } : {}),
+            ...(resultLocations !== undefined && resultLocations.length > 0 ? { locations: resultLocations } : {}),
+            ...(failed || !hasDiffContent
+              ? { rawOutput: toolResultToText(message.content, error) }
+              : {}),
           },
         })
         return
@@ -1552,6 +1579,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     selection: undefined,
     preset: undefined,
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+    pendingToolCalls: new Map(),
   })
 
   /** ISO timestamp of the log's last event, or null for an empty log. */

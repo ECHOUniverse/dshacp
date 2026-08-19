@@ -8,9 +8,24 @@
  * @module dshacp/codec
  */
 
-import type { ContentBlock as AcpContentBlock, PlanEntry, StopReason, ToolKind } from '@agentclientprotocol/sdk'
+import { isAbsolute, join } from 'node:path'
+import type {
+  ContentBlock as AcpContentBlock,
+  PlanEntry,
+  StopReason,
+  ToolCallContent,
+  ToolCallLocation,
+  ToolKind,
+} from '@agentclientprotocol/sdk'
 import type { TurnEndReason } from '@deepseek-ai/dsh-session'
 import type { TodoItem } from '@deepseek-ai/dsh-session'
+
+/** One file change, aligned with DSH `FileDiff` / ACP v1 `Diff`. */
+export interface FileDiff {
+  path: string
+  oldText: string | null
+  newText: string
+}
 
 /**
  * Map a harness turn ending to ACP's terminal reason vocabulary.
@@ -132,6 +147,15 @@ export function toolKindForName(name: string): ToolKind {
  * @returns the title to send as `tool_call.title`.
  */
 export function toolTitleForCall(name: string, args: unknown): string {
+  const n = name.toLowerCase()
+  if (n === 'write') {
+    const path = extractFilePath(args)
+    return path !== undefined ? `Write ${truncate(path, EDIT_TITLE_MAX_LENGTH)}` : name
+  }
+  if (n === 'edit') {
+    const path = extractFilePath(args)
+    return path !== undefined ? `Edit ${truncate(path, EDIT_TITLE_MAX_LENGTH)}` : name
+  }
   if (toolKindForName(name) !== 'execute') return name
   const command = extractCommand(args)
   if (command === undefined) return name
@@ -141,6 +165,9 @@ export function toolTitleForCall(name: string, args: unknown): string {
 
 /** Max length of an execute-tool card title before truncation with an ellipsis. */
 const EXECUTE_TITLE_MAX_LENGTH = 80
+
+/** Max length of a write/edit card title path segment before truncation. */
+const EDIT_TITLE_MAX_LENGTH = 80
 
 /**
  * Pull a command string out of a tool's parsed arguments. Execute-class tools
@@ -155,6 +182,117 @@ function extractCommand(args: unknown): string | undefined {
     if (typeof value === 'string') return value
   }
   return undefined
+}
+
+/** Pull `file_path` from write/edit tool arguments. */
+function extractFilePath(args: unknown): string | undefined {
+  if (typeof args !== 'object' || args === null) return undefined
+  const value = (args as Record<string, unknown>).file_path
+  return typeof value === 'string' ? value : undefined
+}
+
+/**
+ * Resolve a tool's model-facing path to an absolute path for ACP wire.
+ * Relative paths join against the session cwd; absolute paths pass through.
+ * @param path - the model-supplied file path.
+ * @param cwd - the session working directory (may be empty when unknown).
+ * @returns the absolute path, or the original when cwd is absent.
+ */
+export function resolveToolPath(path: string, cwd: string | undefined): string {
+  if (isAbsolute(path)) return path
+  if (cwd !== undefined && cwd.length > 0) return join(cwd, path)
+  return path
+}
+
+/** Whether `value` is a valid {@link FileDiff}. */
+function isFileDiff(value: unknown): value is FileDiff {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const { path, oldText, newText } = value as Record<string, unknown>
+  return typeof path === 'string'
+    && (oldText === null || typeof oldText === 'string')
+    && typeof newText === 'string'
+}
+
+/**
+ * Narrow opaque `tool/result.meta` to non-empty file diffs. Malformed metadata
+ * returns `undefined` so presentation can fall back instead of throwing.
+ * @param meta - result metadata from the session event.
+ * @returns validated hunks, or `undefined` for absent or malformed data.
+ */
+export function parseDiffsFromMeta(meta: unknown): FileDiff[] | undefined {
+  if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return undefined
+  const diffs = (meta as Record<string, unknown>).diffs
+  if (!Array.isArray(diffs) || diffs.length === 0 || !diffs.every(isFileDiff)) return undefined
+  return diffs
+}
+
+/**
+ * Derive call-time preview diffs for write/edit, matching DSH `presentCall`.
+ * @param name - the DSH tool name.
+ * @param args - parsed tool arguments.
+ * @returns preview diffs, or `undefined` for other tools.
+ */
+export function callTimeDiffsForTool(name: string, args: unknown): FileDiff[] | undefined {
+  const n = name.toLowerCase()
+  if (typeof args !== 'object' || args === null) return undefined
+  const record = args as Record<string, unknown>
+  const filePath = record.file_path
+  if (typeof filePath !== 'string') return undefined
+  if (n === 'write') {
+    const content = record.content
+    if (typeof content !== 'string') return undefined
+    return [{ path: filePath, oldText: null, newText: content }]
+  }
+  if (n === 'edit') {
+    const oldString = record.old_string
+    const newString = record.new_string
+    if (typeof oldString !== 'string' || typeof newString !== 'string') return undefined
+    return [{ path: filePath, oldText: oldString || null, newText: newString }]
+  }
+  return undefined
+}
+
+/**
+ * Derive result-time diffs for write/edit, matching DSH `presentResult`.
+ * Prefers `meta.diffs` hunks; write on a new file yields an empty meta array,
+ * so callers fall back to call-time args.
+ * @param name - the DSH tool name.
+ * @param args - parsed tool arguments from the pending call.
+ * @param meta - optional result metadata.
+ * @returns applied diffs, or `undefined` when none can be derived.
+ */
+export function resultDiffsForTool(name: string, args: unknown, meta: unknown): FileDiff[] | undefined {
+  const fromMeta = parseDiffsFromMeta(meta)
+  if (fromMeta !== undefined) return fromMeta
+  const n = name.toLowerCase()
+  if (n === 'write') return callTimeDiffsForTool(name, args)
+  if (n === 'edit') return undefined
+  return undefined
+}
+
+/**
+ * Map file diffs to ACP v1 `ToolCallContent` diff blocks with absolute paths.
+ * @param diffs - one or more file changes.
+ * @param cwd - session working directory for relative-path resolution.
+ * @returns ACP content blocks, empty when `diffs` is empty.
+ */
+export function fileDiffsToAcpContent(diffs: readonly FileDiff[], cwd: string | undefined): ToolCallContent[] {
+  return diffs.map(diff => ({
+    type: 'diff' as const,
+    path: resolveToolPath(diff.path, cwd),
+    oldText: diff.oldText,
+    newText: diff.newText,
+  }))
+}
+
+/**
+ * Derive follow-along file locations from diffs with absolute paths.
+ * @param diffs - one or more file changes.
+ * @param cwd - session working directory for relative-path resolution.
+ * @returns ACP location entries, empty when `diffs` is empty.
+ */
+export function locationsFromDiffs(diffs: readonly FileDiff[], cwd: string | undefined): ToolCallLocation[] {
+  return diffs.map(diff => ({ path: resolveToolPath(diff.path, cwd) }))
 }
 
 /** Truncate to `max` runes, appending `…` only when actually cut. */

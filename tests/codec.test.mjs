@@ -3,14 +3,21 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   acpPromptToText,
+  callTimeDiffsForTool,
   encodeModelOption,
+  fileDiffsToAcpContent,
   imageExtensionForMime,
+  locationsFromDiffs,
+  parseDiffsFromMeta,
   parseModelOption,
   parseToolArguments,
   promptHasUnsupportedContent,
+  resolveToolPath,
+  resultDiffsForTool,
   todoToPlanEntries,
   toolKindForName,
   toolResultToText,
+  toolTitleForCall,
   turnEndToStopReason,
 } from '../lib/codec.js'
 
@@ -113,4 +120,64 @@ test('parseModelOption splits provider-qualified values and rejects bare ids', (
   assert.equal(parseModelOption('provider:'), undefined)
   // a model id containing a separator still splits at the first one
   assert.deepEqual(parseModelOption('p:a:b'), { provider: 'p', model: 'a:b' })
+})
+
+test('resolveToolPath absolutizes relative paths against cwd', () => {
+  assert.equal(resolveToolPath('/abs/foo.ts', '/proj'), '/abs/foo.ts')
+  assert.equal(resolveToolPath('docs/foo.md', '/proj'), '/proj/docs/foo.md')
+  assert.equal(resolveToolPath('rel.txt', ''), 'rel.txt')
+})
+
+test('callTimeDiffsForTool maps write/edit call args to preview diffs', () => {
+  assert.deepEqual(
+    callTimeDiffsForTool('write', { file_path: 'a.ts', content: 'hello' }),
+    [{ path: 'a.ts', oldText: null, newText: 'hello' }],
+  )
+  assert.deepEqual(
+    callTimeDiffsForTool('edit', { file_path: 'b.ts', old_string: 'x', new_string: 'y' }),
+    [{ path: 'b.ts', oldText: 'x', newText: 'y' }],
+  )
+  assert.equal(callTimeDiffsForTool('bash', { command: 'ls' }), undefined)
+})
+
+test('parseDiffsFromMeta validates meta.diffs and rejects malformed data', () => {
+  const valid = { diffs: [{ path: 'a.ts', oldText: 'a', newText: 'b' }] }
+  assert.deepEqual(parseDiffsFromMeta(valid), valid.diffs)
+  assert.equal(parseDiffsFromMeta({ diffs: [] }), undefined)
+  assert.equal(parseDiffsFromMeta({ diffs: [{ path: 1, oldText: null, newText: 'x' }] }), undefined)
+  assert.equal(parseDiffsFromMeta(null), undefined)
+})
+
+test('resultDiffsForTool prefers meta hunks and write falls back to args', () => {
+  const meta = { diffs: [{ path: 'a.ts', oldText: 'old', newText: 'new' }] }
+  assert.deepEqual(
+    resultDiffsForTool('edit', { file_path: 'a.ts', old_string: 'x', new_string: 'y' }, meta),
+    meta.diffs,
+  )
+  assert.deepEqual(
+    resultDiffsForTool('write', { file_path: 'new.ts', content: 'body' }, { diffs: [] }),
+    [{ path: 'new.ts', oldText: null, newText: 'body' }],
+  )
+  assert.equal(
+    resultDiffsForTool('edit', { file_path: 'a.ts', old_string: 'x', new_string: 'y' }, undefined),
+    undefined,
+  )
+})
+
+test('fileDiffsToAcpContent and locationsFromDiffs emit absolute ACP shapes', () => {
+  const diffs = [{ path: 'src/foo.ts', oldText: null, newText: 'hi' }]
+  const cwd = '/project'
+  assert.deepEqual(fileDiffsToAcpContent(diffs, cwd), [{
+    type: 'diff',
+    path: '/project/src/foo.ts',
+    oldText: null,
+    newText: 'hi',
+  }])
+  assert.deepEqual(locationsFromDiffs(diffs, cwd), [{ path: '/project/src/foo.ts' }])
+})
+
+test('write/edit titles include the file path', () => {
+  assert.equal(toolTitleForCall('write', { file_path: 'docs/a.md', content: 'x' }), 'Write docs/a.md')
+  assert.equal(toolTitleForCall('edit', { file_path: 'src/b.ts', old_string: 'a', new_string: 'b' }), 'Edit src/b.ts')
+  assert.equal(toolTitleForCall('write', {}), 'write')
 })

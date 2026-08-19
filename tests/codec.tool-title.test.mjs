@@ -39,8 +39,10 @@ test('overlong commands are truncated to 80 chars with an ellipsis', () => {
   assert.equal(toolTitleForCall('bash', { command: 'a'.repeat(80) }), 'a'.repeat(80))
 })
 
-test('non-execute tools keep the tool name', () => {
+test('non-execute tools keep the tool name except write/edit', () => {
   assert.equal(toolTitleForCall('read', { path: '/x' }), 'read')
+  assert.equal(toolTitleForCall('write', { file_path: 'foo.ts', content: 'x' }), 'Write foo.ts')
+  assert.equal(toolTitleForCall('edit', { file_path: 'bar.ts', old_string: 'a', new_string: 'b' }), 'Edit bar.ts')
 })
 
 test('unknown tools keep the tool name', () => {
