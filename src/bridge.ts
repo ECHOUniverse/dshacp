@@ -57,6 +57,7 @@ import {
 import { installModelSelection, type Agent, type AgentSetup, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import { resolveSessionPreset, type AgentPreset, type AgentPresets } from '@deepseek-ai/dsh-agent-presets'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import type { CommandDescriptor, CommandExecution } from '@deepseek-ai/dsh-commands'
 import { isUserInvocable } from '@deepseek-ai/dsh-skill'
 import * as mcpClient from '@deepseek-ai/dsh-mcp-client'
 import {
@@ -219,6 +220,28 @@ interface SubagentRegistryView {
   listChildren(parentSessionId: SessionId): Promise<readonly { kind: string; id: SessionId }[]>
 }
 
+/** Human-command registry surface consumed by the ACP command adapter. */
+interface CommandRegistryView {
+  list(agent: Agent): readonly CommandDescriptor[]
+  execute(
+    agent: Agent,
+    line: string,
+    imagesOrSignal: readonly unknown[] | AbortSignal,
+    maybeSignal?: AbortSignal,
+  ): Promise<CommandExecution | undefined>
+}
+
+/** Execute one slash command across rc.6 (agent, line, signal) and rc.8+ (agent, line, images, signal). */
+const executeHumanCommand = async (
+  commands: CommandRegistryView,
+  agent: Agent,
+  line: string,
+  signal: AbortSignal,
+): Promise<CommandExecution | undefined> => {
+  if (commands.execute.length >= 4) return commands.execute(agent, line, [], signal)
+  return commands.execute(agent, line, signal)
+}
+
 /** Live state for one open subagent delegation card in an ACP session. */
 interface OpenSubagentCard {
   toolName: string
@@ -326,6 +349,8 @@ interface SessionRecord {
   pendingToolCalls: Map<string, { name: string; args: unknown }>
   /** Open subagent delegation cards keyed by parent tool call id. */
   openSubagents: Map<string, OpenSubagentCard>
+  /** Abort controller for an in-flight human-command execution (prompt/cancel). */
+  commandAbort: AbortController | undefined
 }
 
 /**
@@ -1049,23 +1074,47 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     }
   }
 
-  // ── P4b: slash commands over userInvocable skills ─────────────────────────
+  // ── P4b: slash commands (human commands + userInvocable skills) ───────────
+
+  /** Map one DSH command descriptor onto the ACP `AvailableCommand` shape. */
+  const acpCommandOf = (descriptor: CommandDescriptor): {
+    name: string
+    description: string
+    input?: { hint: string }
+  } => ({
+    name: descriptor.name,
+    description: descriptor.description,
+    ...(descriptor.input?.hint !== undefined ? { input: { hint: descriptor.input.hint } } : {}),
+  })
 
   /**
-   * Push the `/`-menu catalog: every `userInvocable` skill of this session's
-   * scope (DESIGN D10). Invocation itself needs no bridge code — the preset's
-   * `tool-skill` pre-step hook already injects `renderSkillContent` for
-   * `/name` gestures in user messages.
+   * Push the `/`-menu catalog: DSH human commands (`ctx.commands.list`) plus
+   * every `userInvocable` skill of this session's scope (DESIGN D10). Commands
+   * win on name collisions; skill-only names still advertise for the `/name`
+   * gesture the preset's `tool-skill` pre-step injects into user messages.
    */
   const pushAvailableCommands = async (record: SessionRecord): Promise<void> => {
+    const commands = ctx.get('commands') as CommandRegistryView | undefined
     const skills = ctx.get('skills')
-    if (skills === undefined) return
+    if (commands === undefined && skills === undefined) return
     try {
       const session = sessionOf(record)
-      const summaries = await skills.list({ cwd: session.header.cwd, scope: record.agent })
-      const availableCommands = summaries
-        .filter(isUserInvocable)
-        .map(summary => ({ name: summary.name, description: summary.description }))
+      const availableCommands: ReturnType<typeof acpCommandOf>[] = []
+      const commandNames = new Set<string>()
+      if (commands !== undefined) {
+        for (const descriptor of commands.list(record.agent)) {
+          availableCommands.push(acpCommandOf(descriptor))
+          commandNames.add(descriptor.name)
+        }
+      }
+      if (skills !== undefined) {
+        const summaries = await skills.list({ cwd: session.header.cwd, scope: record.agent })
+        for (const summary of summaries.filter(isUserInvocable)) {
+          if (!commandNames.has(summary.name)) {
+            availableCommands.push({ name: summary.name, description: summary.description })
+          }
+        }
+      }
       notify({
         sessionId: session.id,
         update: { sessionUpdate: 'available_commands_update', availableCommands },
@@ -1073,6 +1122,13 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     } catch (error: unknown) {
       logger.warn(`dshacp: available commands update failed: ${String(error)}`)
     }
+  }
+
+  /** The prompt's sole text block, when the prompt is exactly one text block. */
+  const singlePromptText = (prompt: PromptRequest['prompt']): string | undefined => {
+    if (prompt.length !== 1 || prompt[0] === undefined) return undefined
+    if (prompt[0].type !== 'text') return undefined
+    return prompt[0].text
   }
 
   // ── P4b: MCP forwarding (session/new mcpServers → dsh-mcp-client) ─────────
@@ -1608,8 +1664,11 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     if (inflight !== undefined && inflight.messageId === message.id) inflight.turn = turn
   })
 
-  // The `/`-menu catalog tracks the skill catalog: an authoring change (a
-  // skill created or removed) refreshes every live session's commands.
+  // The `/`-menu catalog tracks both registries: a command or skill authoring
+  // change refreshes every live session's advertised slash commands.
+  ctx.on('commands/change', () => {
+    for (const record of sessions.values()) void pushAvailableCommands(record)
+  })
   ctx.on('skills/change', () => {
     for (const record of sessions.values()) void pushAvailableCommands(record)
   })
@@ -1817,6 +1876,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
     pendingToolCalls: new Map(),
     openSubagents: new Map(),
+    commandAbort: undefined,
   })
 
   /** ISO timestamp of the log's last event, or null for an empty log. */
@@ -2119,6 +2179,42 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         if (agents.get(record.agent.id) !== record.agent) {
           throw internalError('prompt was not queued: the agent was disposed outside the bridge')
         }
+
+        // Human slash commands: a single text-only block starting with '/' routes
+        // to the dsh command registry (the same path as the web UI). Unknown names
+        // fall through so `/skill-name` skill gestures still reach the model pre-step.
+        const commandLine = imageRefs.length === 0 ? singlePromptText(params.prompt) : undefined
+        if (commandLine !== undefined && commandLine.trim().startsWith('/')) {
+          const commands = ctx.get('commands') as CommandRegistryView | undefined
+          if (commands !== undefined) {
+            const controller = new AbortController()
+            record.commandAbort = controller
+            try {
+              const execution = await executeHumanCommand(commands, record.agent, commandLine.trim(), controller.signal)
+              if (execution !== undefined) {
+                if (controller.signal.aborted) return { stopReason: 'cancelled' }
+                const output = execution.result.text ?? ''
+                if (output.length > 0) {
+                  notify({
+                    sessionId: sessionOf(record).id,
+                    update: {
+                      sessionUpdate: 'agent_message_chunk',
+                      content: { type: 'text', text: output },
+                      messageId: `cmd-${execution.commandId}`,
+                    },
+                  })
+                }
+                // `/plan`, `/goal`, and similar commands may enqueue agent work.
+                await record.agent.whenIdle()
+                void pushAvailableCommands(record)
+                return { stopReason: 'end_turn' }
+              }
+            } finally {
+              record.commandAbort = undefined
+            }
+          }
+        }
+
         const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
         const stopReason = await new Promise<StopReason>((resolve, reject) => {
           // Arm the slot before followup() so a listener-driven synchronous
@@ -2154,6 +2250,8 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       cancel(params: CancelNotification): Promise<void> {
         const record = sessions.get(SessionId(params.sessionId))
         if (record === undefined) return Promise.resolve()
+        record.commandAbort?.abort()
+        record.commandAbort = undefined
         settlePermission(record, 'cancelled')
         record.agent.cancel({ kind: 'user' })
         settlePrompt(record, 'cancelled')

@@ -286,6 +286,39 @@ test('session creation pushes available_commands_update over userInvocable skill
   await bridge.client.closeSession({ sessionId: created.sessionId })
 })
 
+test('available_commands_update includes DSH human commands (goal)', async () => {
+  const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+  const update = await waitFor(() => bridge.updates.find(update =>
+    update.kind === 'session_update' && update.tag === 'available_commands_update'
+    && update.sessionId === created.sessionId))
+  const goal = update.update.availableCommands.find(command => command.name === 'goal')
+  assert.ok(goal, 'host-plane /goal command is advertised')
+  assert.equal(typeof goal.description, 'string')
+  await bridge.client.closeSession({ sessionId: created.sessionId })
+})
+
+test('/goal executes without a model turn', async () => {
+  const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+  const beforeUsage = bridge.updates.filter(update =>
+    update.kind === 'session_update' && update.tag === 'usage_update'
+    && update.sessionId === created.sessionId).length
+  const result = await bridge.client.prompt({
+    sessionId: created.sessionId,
+    prompt: [{ type: 'text', text: '/goal' }],
+  })
+  assert.equal(result.stopReason, 'end_turn')
+  const chunk = await waitFor(() => bridge.updates.find(update =>
+    update.kind === 'session_update' && update.tag === 'agent_message_chunk'
+    && update.sessionId === created.sessionId
+    && update.update.messageId?.startsWith('cmd-')))
+  assert.ok(chunk.update.content.text.length > 0, 'command output reached the client')
+  const afterUsage = bridge.updates.filter(update =>
+    update.kind === 'session_update' && update.tag === 'usage_update'
+    && update.sessionId === created.sessionId).length
+  assert.equal(afterUsage, beforeUsage, 'human commands do not report token usage')
+  await bridge.client.closeSession({ sessionId: created.sessionId })
+})
+
 test('ask_user_question elicits through the client (P4b-4)', { skip: !PROMPT_AVAILABLE }, async () => {
   const spawned = await initBridge({
     handlers: {
