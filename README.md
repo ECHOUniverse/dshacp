@@ -192,9 +192,9 @@ dsh plugin --profile acp add "@hanxu131/dshacp@latest"
 | `DSH_PERMISSION_MODE` | `workspace-write`（默认，会弹确认框）或 `danger-full-access`（不再弹确认框） |
 | `DSHACP_HYBRID` | 设成 `1` 开启混合模式：写文件时交给 Zed 展示 diff 供你审查 |
 
-### 在 Zed 里选模型 / 思考强度 / 模式
+### 在 Zed 里选模型 / 思考强度 / 权限 / 模式
 
-装好之后，Zed 的 DSH 面板里可以直接选 **model**、**thinking strength**、**mode**。
+装好之后，Zed 的 DSH 面板里可以直接选 **model**、**thinking strength**、**Permissions**、**mode**。
 也可以在配置里写死默认值（下面是示例，模型名以面板里实际显示的为准）：
 
 ```jsonc
@@ -205,12 +205,20 @@ dsh plugin --profile acp add "@hanxu131/dshacp@latest"
   "env": {},
   "default_config_options": {
     "model": "deepseek-official:deepseek-v4-pro",
-    "thought_level": "high"
+    "thought_level": "high",
+    "permission": "workspace-write"
   }
 }
 ```
 
 `model` 的写法是 `提供商:模型`；只写模型名也可以，程序会自动找到对应的提供商。
+
+**Permissions**（`permission`）控制 sandbox 与审批策略，可选值通常为：
+
+- `workspace-write`（默认）：沙箱限制工作区外写入，敏感操作会弹出确认框
+- `danger-full-access`：无沙箱限制，也不再弹出确认框
+
+**mode** 是 agent preset（工具集 / 技能配置），与 **Permissions** 无关；不要与 ACP 文档示例里「mode 控制 permission」的语义混淆。
 
 ### 独立二进制安装（另一种方式，不用 DSH profile）
 
@@ -230,6 +238,22 @@ cd dshacp
 npm install
 npm run build   # 编译 TypeScript
 npm test        # 跑测试
+```
+
+### 本地联调到 DSH acp profile（给开发者）
+
+**不要用 `npm link` 链源码目录**——会把 repo 的 `node_modules/` 带进 profile，导致 Cordis 插件双份加载（`deployment:persona already registered`）或缺少依赖（`schemastery not found`）。
+
+在仓库根目录执行：
+
+```sh
+./scripts/dev-link-dsh-profile.sh   # build → npm pack → 装进 ~/.dsh/profiles/acp
+```
+
+改代码后重新跑该脚本，并**重启 Zed 里的 DSH 会话**。恢复 npm 发布版：
+
+```sh
+./scripts/dev-unlink-dsh-profile.sh
 ```
 
 ### 可选功能

@@ -56,6 +56,7 @@ import {
 } from '@agentclientprotocol/sdk'
 import { installModelSelection, type Agent, type AgentSetup, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import { resolveSessionPreset, type AgentPreset, type AgentPresets } from '@deepseek-ai/dsh-agent-presets'
+import { CUSTOM_PRESET, type PermissionPresetService } from '@deepseek-ai/dsh-permission-presets'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { CommandDescriptor, CommandExecution } from '@deepseek-ai/dsh-commands'
 import { isUserInvocable } from '@deepseek-ai/dsh-skill'
@@ -121,9 +122,10 @@ export const DEFAULT_ELICITATION_TIMEOUT_MS = 30 * 60 * 1000
  */
 export const DEFAULT_BACKGROUND_SETTLE_TIMEOUT_MS = 30 * 60 * 1000
 
-/** ACP config-option ids for model / thinking / mode (DESIGN §12.4). */
+/** ACP config-option ids for model / thinking / permission / mode (DESIGN §12.4). */
 export const MODEL_OPTION_ID = 'model'
 export const THINKING_OPTION_ID = 'thought_level'
+export const PERMISSION_OPTION_ID = 'permission'
 export const MODE_OPTION_ID = 'mode'
 
 /**
@@ -481,6 +483,10 @@ export function apply(ctx: Context, config: BridgeConfig): void {
 
   /** The agent-presets roster (base/preset composition), read structurally. */
   const presetRoster = (): AgentPresets | undefined => ctx.get('agentPresets') as AgentPresets | undefined
+
+  /** The permission-presets service (sandbox + approval bundle), read structurally. */
+  const permissionPresets = (): PermissionPresetService | undefined =>
+    ctx.get('permissionPresets') as PermissionPresetService | undefined
 
   /**
    * The mutable per-session model selection (DESIGN D8/D14). A picked value
@@ -941,6 +947,36 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         })),
       })
     }
+    // Permission select: sandbox/approval preset bundle (same write path as `/permission`).
+    const permissions = permissionPresets()
+    if (permissions !== undefined) {
+      const session = sessionOf(record)
+      const currentPermission = permissions.current(session.events)
+      const permissionOptions = permissions.names.map(name => {
+        const option = permissions.optionOf(name)
+        return {
+          value: option.value,
+          name: option.name,
+          ...withDefined(option, 'description'),
+        }
+      })
+      if (currentPermission === CUSTOM_PRESET) {
+        const custom = permissions.optionOf(CUSTOM_PRESET)
+        permissionOptions.push({
+          value: custom.value,
+          name: custom.name,
+          ...withDefined(custom, 'description'),
+        })
+      }
+      options.push({
+        id: PERMISSION_OPTION_ID,
+        name: 'Permissions',
+        category: '_permission',
+        type: 'select',
+        currentValue: currentPermission,
+        options: permissionOptions,
+      })
+    }
     // Mode select: the preset roster (DESIGN D3/D9).
     const presets = presetRoster()
     if (presets !== undefined) {
@@ -1050,6 +1086,16 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       }
       persistSelection(record)
       persistSessionSelection(record)
+    } else if (params.configId === PERMISSION_OPTION_ID) {
+      const presets = permissionPresets()
+      if (presets === undefined) throw invalidParams('this deployment composes no permission presets')
+      if (params.value === CUSTOM_PRESET) {
+        throw invalidParams('cannot select the derived custom permission state')
+      }
+      if (!presets.names.includes(params.value)) {
+        throw invalidParams(`unknown permission preset: ${params.value}`)
+      }
+      presets.set(sessionOf(record), params.value)
     } else if (params.configId === MODE_OPTION_ID) {
       const presets = presetRoster()
       if (presets === undefined) throw invalidParams('this deployment composes no agent presets')

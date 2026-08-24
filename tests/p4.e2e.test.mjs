@@ -98,6 +98,16 @@ test('session/new returns model/thinking/mode config options (DESIGN D3/D7)', as
   assert.ok(thinking.options.some(option => option.value === thinking.currentValue),
     'current effort is one of the offered efforts')
 
+  const permission = options.find(option => option.id === 'permission')
+  assert.ok(permission, 'permission option present')
+  assert.equal(permission.type, 'select')
+  assert.equal(permission.category, '_permission')
+  assert.equal(permission.currentValue, 'workspace-write', 'session starts in the default permission preset')
+  assert.ok(permission.options.some(option => option.value === 'workspace-write'), 'workspace-write is offered')
+  assert.ok(permission.options.some(option => option.value === 'danger-full-access'), 'danger-full-access is offered')
+  assert.ok(permission.options.some(option => option.value === permission.currentValue),
+    'current permission is one of the offered presets')
+
   const mode = options.find(option => option.id === 'mode')
   assert.ok(mode, 'mode option present')
   assert.equal(mode.type, 'select')
@@ -125,6 +135,49 @@ test('set_config_option switches the model and resets thinking to its default (D
   assert.ok(thinkingAfter, 'thinking option survives the switch')
   assert.ok(thinkingAfter.options.some(option => option.value === thinkingAfter.currentValue),
     'thinking reset to an offered effort of the new model')
+  await bridge.client.closeSession({ sessionId: created.sessionId })
+})
+
+test('set_config_option switches permission presets', async () => {
+  const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+  const after = await bridge.client.setSessionConfigOption({
+    sessionId: created.sessionId,
+    configId: 'permission',
+    value: 'danger-full-access',
+  })
+  const permissionAfter = after.configOptions.find(option => option.id === 'permission')
+  assert.equal(permissionAfter.currentValue, 'danger-full-access', 'permission switched')
+  assert.ok(after.configOptions.find(option => option.id === 'model'), 'model present in the full list')
+  assert.ok(after.configOptions.find(option => option.id === 'mode'), 'mode present in the full list')
+
+  const restored = await bridge.client.setSessionConfigOption({
+    sessionId: created.sessionId,
+    configId: 'permission',
+    value: 'workspace-write',
+  })
+  assert.equal(restored.configOptions.find(option => option.id === 'permission').currentValue,
+    'workspace-write', 'permission switched back')
+  await bridge.client.closeSession({ sessionId: created.sessionId })
+})
+
+test('set_config_option validates unknown permission presets', async () => {
+  const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+  await assert.rejects(
+    bridge.client.setSessionConfigOption({
+      sessionId: created.sessionId,
+      configId: 'permission',
+      value: 'no-such-preset',
+    }),
+    (error) => error.code === -32602,
+  )
+  await assert.rejects(
+    bridge.client.setSessionConfigOption({
+      sessionId: created.sessionId,
+      configId: 'permission',
+      value: 'custom',
+    }),
+    (error) => error.code === -32602,
+  )
   await bridge.client.closeSession({ sessionId: created.sessionId })
 })
 
@@ -439,6 +492,7 @@ test('session/load and resume return config options', { skip: !PROMPT_AVAILABLE 
 
   const loaded = await bridge.client.loadSession({ sessionId: created.sessionId, cwd: PROJECT_ROOT, mcpServers: [] })
   assert.ok(loaded.configOptions.some(option => option.id === 'mode'), 'load returns config options')
+  assert.ok(loaded.configOptions.some(option => option.id === 'permission'), 'load returns permission option')
   await bridge.client.closeSession({ sessionId: created.sessionId })
 
   const resumed = await bridge.client.resumeSession({ sessionId: created.sessionId, cwd: PROJECT_ROOT })
@@ -456,6 +510,7 @@ test('set_config_option responds with the complete option list', async () => {
   })
   assert.equal(after.configOptions.find(option => option.id === 'thought_level').currentValue, 'off')
   assert.ok(after.configOptions.find(option => option.id === 'model'), 'model present in the full list')
+  assert.ok(after.configOptions.find(option => option.id === 'permission'), 'permission present in the full list')
   assert.ok(after.configOptions.find(option => option.id === 'mode'), 'mode present in the full list')
   await bridge.client.closeSession({ sessionId: created.sessionId })
 })

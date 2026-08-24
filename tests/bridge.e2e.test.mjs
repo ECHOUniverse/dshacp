@@ -572,3 +572,25 @@ test('approval bridge: reject-once fails the tool closed', { skip: !PROMPT_AVAIL
   assert.match(String(settled.update.rawOutput), /reject/i, 'rawOutput reports the rejection')
   await bridge.client.closeSession({ sessionId: created.sessionId })
 })
+
+test('permission preset danger-full-access skips approval pushes', { skip: !PROMPT_AVAILABLE }, async () => {
+  const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
+  await bridge.client.setSessionConfigOption({
+    sessionId: created.sessionId,
+    configId: 'permission',
+    value: 'danger-full-access',
+  })
+  const permissionCountBefore = bridge.updates.filter(update =>
+    update.kind === 'request_permission' && update.params.sessionId === created.sessionId).length
+  const result = await bridge.client.prompt({
+    sessionId: created.sessionId,
+    prompt: [{ type: 'text', text: 'Run: touch ~/dshacp-full-access-probe. Confirm the file was created.' }],
+  })
+  assert.ok(['end_turn', 'max_tokens'].includes(result.stopReason), `prompt settled: ${result.stopReason}`)
+  const permissionCountAfter = bridge.updates.filter(update =>
+    update.kind === 'request_permission' && update.params.sessionId === created.sessionId).length
+  assert.equal(permissionCountAfter, permissionCountBefore,
+    'danger-full-access does not push request_permission')
+  await bridge.client.closeSession({ sessionId: created.sessionId })
+  await rm(join(homedir(), 'dshacp-full-access-probe'), { force: true })
+})

@@ -237,11 +237,11 @@ After upgrading, **restart the DSH session in Zed** (or restart the
 | `DSH_PERMISSION_MODE` | `workspace-write` (default, shows confirmations) or `danger-full-access` (no confirmations) |
 | `DSHACP_HYBRID` | Set to `1` to enable hybrid mode: file writes are delegated to Zed as reviewable diffs |
 
-### Choosing model / thinking strength / mode in Zed
+### Choosing model / thinking strength / permissions / mode in Zed
 
-Once installed, you can pick **model**, **thinking strength**, and **mode**
-directly in Zed's DSH panel. You can also pin defaults in the config (the example
-below is illustrative — use whatever the panel actually shows):
+Once installed, you can pick **model**, **thinking strength**, **Permissions**, and
+**mode** directly in Zed's DSH panel. You can also pin defaults in the config (the
+example below is illustrative — use whatever the panel actually shows):
 
 ```jsonc
 "DSH": {
@@ -251,13 +251,21 @@ below is illustrative — use whatever the panel actually shows):
   "env": {},
   "default_config_options": {
     "model": "deepseek-official:deepseek-v4-pro",
-    "thought_level": "high"
+    "thought_level": "high",
+    "permission": "workspace-write"
   }
 }
 ```
 
 The `model` value is `provider:model`; a bare model id also works and resolves
 to the provider that owns it.
+
+**Permissions** (`permission`) controls the sandbox and approval policy. Typical values:
+
+- `workspace-write` (default): sandbox restricts writes outside the workspace; sensitive operations prompt for confirmation
+- `danger-full-access`: no sandbox restrictions and no confirmation prompts
+
+**mode** is the agent preset (tooling / skill set) and is separate from **Permissions**; do not confuse it with the ACP doc example where a `mode` option controls permission behavior.
 
 ### Install as a standalone binary (alternative, no DSH profile)
 
@@ -279,6 +287,25 @@ cd dshacp
 npm install
 npm run build   # compile TypeScript
 npm test        # run tests
+```
+
+### Link a local build into the DSH acp profile (for developers)
+
+**Do not `npm link` the source tree** — it pulls the repo's `node_modules/` into the
+profile, which duplicates Cordis plugins (`deployment:persona already registered`)
+or breaks imports (`schemastery not found`).
+
+From the repo root:
+
+```sh
+./scripts/dev-link-dsh-profile.sh   # build → npm pack → install into ~/.dsh/profiles/acp
+```
+
+After code changes, re-run that script and **restart your Zed DSH session**. To restore
+the registry release:
+
+```sh
+./scripts/dev-unlink-dsh-profile.sh
 ```
 
 ### Optional features
