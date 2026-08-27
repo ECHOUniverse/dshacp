@@ -95,7 +95,18 @@ const pkg = JSON.parse(fs.readFileSync(path, 'utf8'))
 pkg.dependencies['@hanxu131/dshacp'] = '^' + version
 fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n')
 " "$PROFILE/package.json" "$NEW_VERSION"
-    (cd "$PROFILE" && dsh plugin --profile acp update @hanxu131/dshacp)
+    for attempt in 1 2 3 4 5; do
+      if (cd "$PROFILE" && dsh plugin --profile acp update @hanxu131/dshacp); then
+        break
+      fi
+      if [[ "$attempt" -eq 5 ]]; then
+        echo "Install failed after 5 attempts; registry may still be propagating." >&2
+        echo "Retry: dsh plugin --profile acp update @hanxu131/dshacp" >&2
+        exit 1
+      fi
+      echo "Registry not ready yet; retrying in ${attempt}0s..."
+      sleep "${attempt}0"
+    done
   else
     echo "Profile not found at $PROFILE; skip install (run: dsh plugin --profile acp update @hanxu131/dshacp)" >&2
   fi
