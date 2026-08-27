@@ -1,4 +1,5 @@
 node_modules/
+.cursor/
 .dev-link-pack/
 lib/
 docs/
