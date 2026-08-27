@@ -56,8 +56,9 @@ if [[ -n "$(git status --porcelain)" ]]; then
   exit 1
 fi
 
-echo "Running tests..."
-npm test
+echo "Running typecheck and unit tests..."
+npm run typecheck
+npm run test:unit
 
 OLD_VERSION="$(node -p "require('./package.json').version")"
 
