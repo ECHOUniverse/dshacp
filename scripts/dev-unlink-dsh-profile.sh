@@ -6,13 +6,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROFILE="${DSH_PROFILE:-$HOME/.dsh/profiles/acp}"
 
-echo "Restoring registry @hanxu131/dshacp in $PROFILE ..."
+VERSION="$(node -p "require('$ROOT/package.json').version")"
+echo "Restoring registry @hanxu131/dshacp@^$VERSION in $PROFILE ..."
 node -e "
 const fs = require('node:fs')
 const path = process.argv[1]
 const wsPath = process.argv[2]
+const version = process.argv[3]
 const pkg = JSON.parse(fs.readFileSync(path, 'utf8'))
-pkg.dependencies['@hanxu131/dshacp'] = '0.1.9'
+pkg.dependencies['@hanxu131/dshacp'] = '^' + version
 fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n')
 if (fs.existsSync(wsPath)) {
   const lines = fs.readFileSync(wsPath, 'utf8').split('\n')
@@ -28,7 +30,7 @@ if (fs.existsSync(wsPath)) {
   }
   fs.writeFileSync(wsPath, out.join('\n').replace(/\n+$/, '\n'))
 }
-" "$PROFILE/package.json" "$PROFILE/pnpm-workspace.yaml"
+" "$PROFILE/package.json" "$PROFILE/pnpm-workspace.yaml" "$VERSION"
 
 (cd "$PROFILE" && dsh plugin --profile acp update @hanxu131/dshacp)
 
