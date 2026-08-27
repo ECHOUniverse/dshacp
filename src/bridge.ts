@@ -30,7 +30,6 @@ import {
   type CloseSessionRequest,
   type CreateElicitationResponse,
   type DeleteSessionRequest,
-  type ElicitationSchema,
   type InitializeRequest,
   type InitializeResponse,
   type ListSessionsRequest,
@@ -100,6 +99,7 @@ import {
   toolTitleForCall,
   turnEndToStopReason,
 } from './codec.ts'
+import { mapUserQuestionsToElicitation } from './elicitation-map.ts'
 
 export const name = 'dshacp-bridge'
 /** The bridge creates and owns agents; the title service and store serve the wire. */
@@ -1309,30 +1309,13 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     if (!clientElicitation) {
       throw new UserQuestionError('the ACP client does not advertise elicitation; ask_user_question is unavailable', 'CLIENT_UNSUPPORTED')
     }
-    const properties: ElicitationSchema['properties'] = {}
-    const required: string[] = []
-    for (const [index, question] of request.questions.entries()) {
-      const key = `q${index}`
-      const description = question.detail !== undefined
-        ? `${question.question}\n\n${question.detail}`
-        : question.question
-      const labels = question.options?.map(option => option.label) ?? []
-      if (question.multiSelect === true) {
-        properties[key] = { type: 'array', description, items: { type: 'string', enum: labels } }
-      } else if (labels.length > 0) {
-        properties[key] = { type: 'string', description, enum: labels }
-      } else {
-        properties[key] = { type: 'string', description }
-      }
-      required.push(key)
-    }
-    const message = request.questions.map(question => question.question).join(' ')
+    const { message, schema } = mapUserQuestionsToElicitation(request.questions)
     const response = await raceElicitation(
       conn.unstable_createElicitation!({
         mode: 'form',
         message,
         sessionId: sessionOf(record).id,
-        requestedSchema: { type: 'object', properties, required },
+        requestedSchema: schema,
       }),
       request.signal,
       elicitationTimeoutMs,
