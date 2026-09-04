@@ -34,6 +34,17 @@
         default: standard
         roots: []
 
+    # The DSHACP profile startup latch (help/--dump-config must not claim stdio).
+    - id: dshacp-app-startup
+      name: '@hanxu131/dshacp/startup'
+
+    # Standard preset subagent tools with `modelSelectionSettings: true` need
+    # this host row (0.1.2).
+    - id: subagent-model-selection
+      name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'
+      config:
+        enabled: false
+
     # NOTE: the `ssh` row (@linxin666/dsh-ssh) is deliberately absent from the
     # bundle form. It is itself a DSH bundle whose ssh2 dependency needs a
     # native build script, which would break the one-command `dsh plugin add`

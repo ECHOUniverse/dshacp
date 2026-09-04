@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install a local build of @hanxu131/dshacp into ~/.dsh/profiles/acp for Zed testing.
+# Install a local build of @hanxu131/dshacp into ~/.dsh/profiles/dshacp for Zed testing.
 #
 # Do NOT `npm link` the source tree: its node_modules/ pins a second copy of
 # @deepseek-ai/* (rc.6) beside the profile graph (rc.8 / global dsh), which
@@ -12,7 +12,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PROFILE="${DSH_PROFILE:-$HOME/.dsh/profiles/acp}"
+PROFILE="${DSH_PROFILE:-$HOME/.dsh/profiles/dshacp}"
 PACK_DIR="$ROOT/.dev-link-pack"
 
 # Restore legacy full hide if present.

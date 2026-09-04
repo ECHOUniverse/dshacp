@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Restore the acp profile to the registry @hanxu131/dshacp.
+# Restore the dshacp profile to the registry @hanxu131/dshacp.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PROFILE="${DSH_PROFILE:-$HOME/.dsh/profiles/acp}"
+PROFILE="${DSH_PROFILE:-$HOME/.dsh/profiles/dshacp}"
 
 VERSION="$(node -p "require('$ROOT/package.json').version")"
 echo "Restoring registry @hanxu131/dshacp@^$VERSION in $PROFILE ..."
@@ -32,6 +32,6 @@ if (fs.existsSync(wsPath)) {
 }
 " "$PROFILE/package.json" "$PROFILE/pnpm-workspace.yaml" "$VERSION"
 
-(cd "$PROFILE" && dsh plugin --profile acp update @hanxu131/dshacp)
+(cd "$PROFILE" && dsh plugin --profile dshacp update @hanxu131/dshacp)
 
 echo "Done. Optional: rm -rf $ROOT/.dev-link-pack"

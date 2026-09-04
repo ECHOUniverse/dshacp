@@ -107,6 +107,13 @@ export function spawnBridge(options = {}) {
         ? handlers.unstable_createElicitation(params)
         : { action: 'cancel' }
     },
+    createElicitation: async (params) => {
+      updates.push({ kind: 'elicitation', params })
+      const handler = handlers.createElicitation ?? handlers.unstable_createElicitation
+      return handler
+        ? handler(params)
+        : { action: 'cancel' }
+    },
     sessionUpdate: async (params) => {
       const tag = params.update.sessionUpdate
       updates.push({ kind: 'session_update', tag, sessionId: params.sessionId, update: params.update })

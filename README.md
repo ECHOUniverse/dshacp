@@ -18,7 +18,7 @@
    Zed 编辑器（代理面板）
         │   ← 用 ACP 协议对话
         ▼
-   dsh --profile acp（装了 DSHACP 插件的 DSH）
+   dsh --profile dshacp（装了 DSHACP 插件的 DSH）
         │
         ▼
    DeepSeek（真正回答问题、写代码的大模型）
@@ -33,6 +33,30 @@ Zed 自带的是 Claude、GPT 等模型的连接方式。给 DSH 装上 DSHACP �
 - 让它读文件、写代码、跑命令，每一步操作都能在界面上看到
 - 它要做有风险的操作（比如改文件）时，会先弹窗问你"允许吗"
 - 对话自动保存，下次打开还能接着聊
+
+## 和官方 `dsh --profile acp` 有什么区别？
+
+DSH 0.1.2 起，官方在 npm 上同时提供 **`@deepseek-ai/dsh-acp`**（`dsh --profile acp`）和本插件
+**`@hanxu131/dshacp`**（`dsh --profile dshacp`）。两者都走 ACP v1 / stdio，但定位不同，**不要装进同一个 profile**。
+
+| | 官方 `@deepseek-ai/dsh-acp` | 本插件 DSHACP |
+|---|---|---|
+| **启动** | `dsh --profile acp` | `dsh --profile dshacp` |
+| **面向谁** | CI、脚本、自动化流水线 | [Zed](https://zed.dev) 等交互式 ACP 客户端 |
+| **会话** | 基本 `new` / `prompt` / `cancel` | `list` / `load` / `resume` / `delete` / `close` 等完整生命周期 |
+| **流式** | 以回合级文本为主 | **token 级** `assistant/chunk`、reasoning、工具输入输出 |
+| **审批** | 较简 | 推送 `request_permission` 到客户端，支持 allow once / always |
+| **配置** | 无 | Zed 面板可选 **model / thinking / permission / mode**（agent preset） |
+| **扩展** | 无 | slash 命令、plan、`ask_user_question`（elicitation）、HTTP MCP 转发、可选 hybrid 写文件 |
+| **安装** | DSH 自带 / 官方 profile | `dsh plugin --profile dshacp add @hanxu131/dshacp` |
+
+一句话：**官方 ACP 够用且克制，适合「机器调机器」；DSHACP 是加宽桥，把 DSH 的交互能力完整暴露给 Zed。**
+
+```
+Zed ──ACP──► dsh --profile dshacp ──► @hanxu131/dshacp（本插件）
+
+CI  ──ACP──► dsh --profile acp  ──► @deepseek-ai/dsh-acp（官方，互不混装）
+```
 
 ---
 
@@ -57,7 +81,7 @@ dsh --version
 打开终端，输入这一条命令：
 
 ```sh
-dsh plugin --profile acp add @hanxu131/dshacp
+dsh plugin --profile dshacp add @hanxu131/dshacp
 ```
 
 > 首次安装会直接装到 npm 上的最新版（`latest`），无需指定版本号。
@@ -67,14 +91,14 @@ dsh plugin --profile acp add @hanxu131/dshacp
 已装过的用户升级时，**推荐直接用 `update` 命令**（无需手动写版本号）：
 
 ```sh
-dsh plugin --profile acp update @hanxu131/dshacp
+dsh plugin --profile dshacp update @hanxu131/dshacp
 ```
 
 为了让它稳定生效，先在 profile 目录的 `pnpm-workspace.yaml` 里**永久关闭发布年龄门控**，
 加一行 `minimumReleaseAge: 0`：
 
 ```sh
-# 打开 ~/.dsh/profiles/acp/pnpm-workspace.yaml，在 autoInstallPeers 那行下面加上：
+# 打开 ~/.dsh/profiles/dshacp/pnpm-workspace.yaml，在 autoInstallPeers 那行下面加上：
 minimumReleaseAge: 0
 ```
 
@@ -82,12 +106,26 @@ minimumReleaseAge: 0
 > 供应链门控挡下，`update` 会误报 `Already up to date`。设为 `0` 即永久关闭门控，
 > 之后 `update` 会正常追到最新版。
 
-升级完成后，**退出并重开 Zed 里的 DSH 会话**（或重启 `dsh --profile acp` 进程），
+升级完成后，**退出并重开 Zed 里的 DSH 会话**（或重启 `dsh --profile dshacp` 进程），
 新代码才会被加载。
 
 > 备选：若不想改配置，也可显式带版本号
-> `dsh plugin --profile acp add "@hanxu131/dshacp@^0.1.4"`；但由于 `add` 存在
+> `dsh plugin --profile dshacp add "@hanxu131/dshacp@^0.2.0"`；但由于 `add` 存在
 > lock 锁定、`update` 更省心，日常仍建议用上面的 `update` 方式。
+
+### 从旧版 `acp` profile 迁移（0.2.0 起）
+
+DSH 0.1.2 起，官方 `dsh --profile acp` 留给 `@deepseek-ai/dsh-acp`（自动化专用 ACP）。
+DSHACP 改用独立 profile **`dshacp`**，不要与官方 `acp` profile 混装。
+
+若你曾把本插件装进 `~/.dsh/profiles/acp`：
+
+```sh
+dsh plugin --profile acp remove @hanxu131/dshacp
+dsh plugin --profile dshacp add @hanxu131/dshacp
+```
+
+然后把 Zed 配置里的 `"args": ["--profile", "acp"]` 改成 `"dshacp"`，并重启 DSH 会话。
 
 ## 第 2 步：在 Zed 里添加 DSH
 
@@ -101,14 +139,14 @@ minimumReleaseAge: 0
     "DSH": {
       "type": "custom",
       "command": "dsh",
-      "args": ["--profile", "acp"],
+      "args": ["--profile", "dshacp"],
       "env": {}
     }
   }
 }
 ```
 
-> 这里 `command` 是 `dsh`（不是 `dshacp`）：Zed 会用 `dsh --profile acp` 启动
+> 这里 `command` 是 `dsh`（不是 `dshacp`）：Zed 会用 `dsh --profile dshacp` 启动
 > 我们刚才装好的那个 profile。`env` 留空即可。
 
 **成功的样子**：Zed 的代理列表里出现一个叫 **DSH** 的选项。
@@ -156,11 +194,11 @@ DeepSeek API Key 即可。
   `update` 也会被供应链安全门控挡下，同样显示 `Already up to date`。
 
 **推荐做法：永久关闭门控 + 用 `update` 追新**（见「第 1 步 → 更新到新版本」）。
-在 `~/.dsh/profiles/acp/pnpm-workspace.yaml` 加一行 `minimumReleaseAge: 0` 后，
+在 `~/.dsh/profiles/dshacp/pnpm-workspace.yaml` 加一行 `minimumReleaseAge: 0` 后，
 升级命令就固定为：
 
 ```sh
-dsh plugin --profile acp update @hanxu131/dshacp
+dsh plugin --profile dshacp update @hanxu131/dshacp
 ```
 
 若不愿改配置，也可以临时显式带版本号（profile 名 `acp`、包名 `@hanxu131/dshacp`，
@@ -168,14 +206,14 @@ dsh plugin --profile acp update @hanxu131/dshacp
 
 ```sh
 # ✅ 临时可行：显式带上目标版本范围
-dsh plugin --profile acp add "@hanxu131/dshacp@^0.1.4"
+dsh plugin --profile dshacp add "@hanxu131/dshacp@^0.1.4"
 
 # ❌ 无效：不带版本、或只写 @latest，都会被锁定/门控挡住
-dsh plugin --profile acp add @hanxu131/dshacp
-dsh plugin --profile acp add "@hanxu131/dshacp@latest"
+dsh plugin --profile dshacp add @hanxu131/dshacp
+dsh plugin --profile dshacp add "@hanxu131/dshacp@latest"
 ```
 
-升级完记得**重启 Zed 里的 DSH 会话**（或重启 `dsh --profile acp` 进程）让新代码生效。
+升级完记得**重启 Zed 里的 DSH 会话**（或重启 `dsh --profile dshacp` 进程）让新代码生效。
 
 ---
 
@@ -201,7 +239,7 @@ dsh plugin --profile acp add "@hanxu131/dshacp@latest"
 "DSH": {
   "type": "custom",
   "command": "dsh",
-  "args": ["--profile", "acp"],
+      "args": ["--profile", "dshacp"],
   "env": {},
   "default_config_options": {
     "model": "deepseek-official:deepseek-v4-pro",
@@ -240,14 +278,14 @@ npm run build   # 编译 TypeScript
 npm test        # 跑测试
 ```
 
-### 本地联调到 DSH acp profile（给开发者）
+### 本地联调到 DSH dshacp profile（给开发者）
 
 **不要用 `npm link` 链源码目录**——会把 repo 的 `node_modules/` 带进 profile，导致 Cordis 插件双份加载（`deployment:persona already registered`）或缺少依赖（`schemastery not found`）。
 
 在仓库根目录执行：
 
 ```sh
-./scripts/dev-link-dsh-profile.sh   # build → npm pack → 装进 ~/.dsh/profiles/acp
+./scripts/dev-link-dsh-profile.sh   # build → npm pack → 装进 ~/.dsh/profiles/dshacp
 ```
 
 改代码后重新跑该脚本，并**重启 Zed 里的 DSH 会话**。恢复 npm 发布版：
@@ -260,7 +298,7 @@ npm test        # 跑测试
 
 - **粘贴截图让 DeepSeek 看**：装好 `uv`/`uvx` 和 qwenmm 插件后，可以直接把截图粘进
   Zed 让模型"看图"。详见 `docs/P5-image-paste-qwenmm.md`。
-- **远程 SSH**：`dsh plugin --profile acp add @linxin666/dsh-ssh`。
+- **远程 SSH**：`dsh plugin --profile dshacp add @linxin666/dsh-ssh`。
 - **混合模式**：`DSHACP_HYBRID=1`，文件改动以 diff 形式呈现，逐块审查。
 
 ### ACP 能力面（协议层，给开发者）

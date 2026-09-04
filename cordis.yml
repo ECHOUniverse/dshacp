@@ -20,7 +20,7 @@
 # DSH home `.env` via dsh-app-boot) before this config.
 
 # The preset roster: each ACP session composes its agent from one preset
-# (standard / cordis / code / minimal), mounted ONCE per preset under a
+# (standard / cordis / ptc / minimal), mounted ONCE per preset under a
 # standing scope. `default` is the mode a session starts in; the ACP
 # `mode` config option can switch a blank session (DESIGN D9). The shipped
 # root is the dsh installation's `config/agent-presets`, exposed to this
@@ -34,15 +34,16 @@
       - path: !!js ctx.shippedPresetRoot
         trust: system
 
-# P2-2: remote SSH operations (engine + model tools + prompt announcement).
-# The app provides a no-op `webServer` stub because this process serves no
-# HTTP; host management and the web terminal stay in the DSH web app. Hosts
-# are configured by the user in ~/.dsh/dsh-ssh.json (shared with the web app).
-- id: ssh
-  name: '@linxin666/dsh-ssh'
+# Host-owned opt-in setting for the standard preset's `modelSelectionSettings`
+# subagent tool (0.1.2); defaults off when no user settings override.
+- id: subagent-model-selection
+  name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'
   config:
-    announceToAgent: true
-    enabled: true
+    enabled: false
+
+# P2-2: remote SSH is optional — add with `dsh plugin --profile dshacp add @linxin666/dsh-ssh`
+# when a compatible build is available. It is deliberately omitted from the
+# default standalone composition (same as the bundle patch).
 
 # The DSHACP app: the widened ACP bridge over the base composition. Sessions,
 # streaming, approval, config options (model / thinking / mode), slash

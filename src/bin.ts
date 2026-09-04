@@ -22,6 +22,7 @@
 
 import { parseArgs } from 'node:util'
 import { fileURLToPath } from 'node:url'
+import { SHIPPED_PRESET_ROOT } from '@deepseek-ai/dsh-agent-presets'
 import { boot, installFailLoud, loadEnv, loadOverlayPatches, resolveConfigPath } from '@deepseek-ai/dsh-app-boot'
 
 const NAME = 'dshacp'
@@ -31,12 +32,8 @@ const SHIPPED_CONFIG = fileURLToPath(new URL('../cordis.yml', import.meta.url))
 const SHIPPED_OVERLAY = fileURLToPath(new URL('../dshacp.patch.yml', import.meta.url))
 /** The dsh-base bundle patch: the shared host core, inherited from DSH. */
 const BASE_PATCH = fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-base/cordis.patch.yml'))
-/**
- * The shipped agent-preset compositions (`standard`/`cordis`/`code`/`minimal`),
- * owned by the dsh CLI package like the web app's shipped root. Exposed to
- * the `agent-presets` row's `!!js` expression through a boot-provided value.
- */
-const SHIPPED_PRESET_ROOT = fileURLToPath(import.meta.resolve('@deepseek-ai/dsh/config/agent-presets'))
+/** Shipped preset compositions (`standard` / `cordis` / `ptc` / `minimal`). */
+const shippedPresetRoot = SHIPPED_PRESET_ROOT
 
 /* v8 ignore start -- thin self-executing composition over the unit-tested
    dsh-app-boot helpers; exercised end-to-end by the built-bin smoke */
@@ -75,7 +72,7 @@ const ctx = await boot(
   (hostCtx) => {
     // The roster's shipped root is an assembly fact of the dsh installation,
     // resolved by this bin (the same treatment apps/cli gives it).
-    hostCtx.provide('shippedPresetRoot', SHIPPED_PRESET_ROOT)
+    hostCtx.provide('shippedPresetRoot', shippedPresetRoot)
   },
 )
 // EOF closes the ACP connection; dispose the tree (flush persistence, drain

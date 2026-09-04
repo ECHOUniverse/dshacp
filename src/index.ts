@@ -22,6 +22,7 @@ import type z from '@deepseek-ai/schemastery'
 import * as bridge from './bridge.ts'
 import { pickDefined } from './options.ts'
 import { provideWebServerStub } from './webserver-stub.ts'
+import { DSHACP_APP_STARTUP_SERVICE } from './startup.ts'
 
 export const name = 'dshacp'
 
@@ -43,6 +44,12 @@ export const Config: z<Config> = bridge.Config
  * `hmr` — stdout stays pure.
  */
 export async function apply(ctx: Context, config: Config): Promise<void> {
+  // Standalone `dshacp` has no profile startup row; publish readiness so the
+  // bridge can claim stdio. Profile mode's `dshacp-app-startup` row provides
+  // this after parsing `--help` / binding stdin EOF.
+  if (ctx.get(DSHACP_APP_STARTUP_SERVICE) === undefined) {
+    ctx.provide(DSHACP_APP_STARTUP_SERVICE, { accepted: true })
+  }
   // Route every structured log record to stderr: stdout is reserved for ACP
   // JSON-RPC. Cordis's default exporter only buffers, so without this the
   // bridge's diagnostics would be silently dropped.

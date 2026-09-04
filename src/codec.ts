@@ -18,7 +18,7 @@ import type {
   ToolKind,
 } from '@agentclientprotocol/sdk'
 import type { TurnEndReason } from '@deepseek-ai/dsh-session'
-import type { TodoItem } from '@deepseek-ai/dsh-session'
+import type { TodoItem } from '@deepseek-ai/dsh-tool-todo/client'
 
 /** One file change, aligned with DSH `FileDiff` / ACP v1 `Diff`. */
 export interface FileDiff {

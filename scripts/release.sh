@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publish @hanxu131/dshacp to npm and update the local DSH acp profile.
+# Publish @hanxu131/dshacp to npm and update the local DSH dshacp profile.
 #
 # Usage:
 #   ./scripts/release.sh "short release note"              # patch bump (0.1.9 → 0.1.10)
@@ -12,7 +12,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PROFILE="${DSH_PROFILE:-$HOME/.dsh/profiles/acp}"
+PROFILE="${DSH_PROFILE:-$HOME/.dsh/profiles/dshacp}"
 INSTALL=1
 
 usage() {
@@ -96,19 +96,19 @@ pkg.dependencies['@hanxu131/dshacp'] = '^' + version
 fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n')
 " "$PROFILE/package.json" "$NEW_VERSION"
     for attempt in 1 2 3 4 5; do
-      if (cd "$PROFILE" && dsh plugin --profile acp update @hanxu131/dshacp); then
+      if (cd "$PROFILE" && dsh plugin --profile dshacp update @hanxu131/dshacp); then
         break
       fi
       if [[ "$attempt" -eq 5 ]]; then
         echo "Install failed after 5 attempts; registry may still be propagating." >&2
-        echo "Retry: dsh plugin --profile acp update @hanxu131/dshacp" >&2
+        echo "Retry: dsh plugin --profile dshacp update @hanxu131/dshacp" >&2
         exit 1
       fi
       echo "Registry not ready yet; retrying in ${attempt}0s..."
       sleep "${attempt}0"
     done
   else
-    echo "Profile not found at $PROFILE; skip install (run: dsh plugin --profile acp update @hanxu131/dshacp)" >&2
+    echo "Profile not found at $PROFILE; skip install (run: dsh plugin --profile dshacp update @hanxu131/dshacp)" >&2
   fi
 fi
 

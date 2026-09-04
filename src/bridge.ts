@@ -24,7 +24,6 @@ import {
   ndJsonStream,
   PROTOCOL_VERSION,
   RequestError,
-  type Agent as AcpAgent,
   type AuthenticateRequest,
   type CancelNotification,
   type CloseSessionRequest,
@@ -54,7 +53,7 @@ import {
   type ToolCallUpdate,
 } from '@agentclientprotocol/sdk'
 import { installModelSelection, type Agent, type AgentSetup, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
-import { resolveSessionPreset, type AgentPreset, type AgentPresets } from '@deepseek-ai/dsh-agent-presets'
+import { type AgentPreset, type AgentPresets } from '@deepseek-ai/dsh-agent-presets'
 import { CUSTOM_PRESET, type PermissionPresetService } from '@deepseek-ai/dsh-permission-presets'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type { CommandDescriptor, CommandExecution } from '@deepseek-ai/dsh-commands'
@@ -75,6 +74,8 @@ import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-agent-presets'
 // Declaration-merge subagent lifecycle events observed by the bridge.
 import type {} from '@deepseek-ai/dsh-subagent'
+// Declaration-merge `todo/write` session events for plan replay.
+import type {} from '@deepseek-ai/dsh-tool-todo'
 import { type ApprovalOutcome } from '@deepseek-ai/dsh-user-approval/types'
 import {
   acpPromptToText,
@@ -103,7 +104,7 @@ import { mapUserQuestionsToElicitation } from './elicitation-map.ts'
 
 export const name = 'dshacp-bridge'
 /** The bridge creates and owns agents; the title service and store serve the wire. */
-export const inject = ['agents', 'sessionTitle', 'sessions', 'userQuestions', 'llm']
+export const inject = ['agents', 'sessionTitle', 'sessions', 'userQuestions', 'llm', 'dshacpAppStartup']
 
 /** Default permission-request timeout: fail-closed after this long (DESIGN §7). */
 export const DEFAULT_APPROVAL_TIMEOUT_MS = 10 * 60 * 1000
@@ -365,7 +366,6 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   // injected services during apply rather than reading them lazily in a callback.
   const agents = ctx.agents
   const logger = ctx.logger
-  const userQuestions = ctx.userQuestions
   const sessions = new Map<SessionId, SessionRecord>()
   const approvalTimeoutMs = config.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS
   const elicitationTimeoutMs = config.elicitationTimeoutMs ?? DEFAULT_ELICITATION_TIMEOUT_MS
@@ -573,7 +573,13 @@ export function apply(ctx: Context, config: BridgeConfig): void {
 
   /** Whether a session has produced nothing — the only state a mode switch may mutate (D9). */
   const sessionBlank = (session: Session): boolean =>
-    !session.events.some(event => event.type === 'turn/start')
+    !session.snapshotEvents().some(event => event.type === 'turn/start')
+
+  /** Resolve the preset id a live session runs on (scope chain, then header). */
+  const composedPresetId = (agent: Agent): string | undefined => {
+    const presets = presetRoster()
+    return presets?.composedPreset(agent.ctx) ?? agent.session.header.agentPreset
+  }
 
   /**
    * Return the bridge-owned record for an agent, rejecting same-id impostors.
@@ -951,7 +957,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     const permissions = permissionPresets()
     if (permissions !== undefined) {
       const session = sessionOf(record)
-      const currentPermission = permissions.current(session.events)
+      const currentPermission = permissions.current(session)
       const permissionOptions = permissions.names.map(name => {
         const option = permissions.optionOf(name)
         return {
@@ -1311,7 +1317,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     }
     const { message, schema } = mapUserQuestionsToElicitation(request.questions)
     const response = await raceElicitation(
-      conn.unstable_createElicitation!({
+      conn.createElicitation({
         mode: 'form',
         message,
         sessionId: sessionOf(record).id,
@@ -1328,8 +1334,9 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         'USER_DECLINED',
       )
     }
+    const content = response.content as Record<string, unknown> | undefined
     const answers = request.questions.map((question, index) => {
-      const value = response.content?.[`q${index}`]
+      const value = content?.[`q${index}`]
       const selected = Array.isArray(value)
         ? value.map(String)
         : value !== undefined && value !== null
@@ -1340,8 +1347,23 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     return { answers }
   }
 
-  // The single UI provider slot belongs to this bridge for the whole process.
-  userQuestions.registerProvider({ ask: askViaElicitation })
+  // The single UI answerer for this bridge: ACP elicitation when the client
+  // advertises form support; otherwise fall through to any downstream provider.
+  ctx.on('user-questions/request', async (request, next) => {
+    if (!clientElicitation) return next()
+    try {
+      return await askViaElicitation(request)
+    } catch (error: unknown) {
+      if (error instanceof UserQuestionError && (
+        error.code === 'CONNECTION_NOT_READY'
+        || error.code === 'CALLER_NOT_LIVE'
+        || error.code === 'CLIENT_UNSUPPORTED'
+      )) {
+        return next()
+      }
+      throw error
+    }
+  })
 
   /**
    * Fold one call's token accounting into the session record and report the
@@ -1858,7 +1880,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     const agent = agentCtx.agent
     if (presets !== undefined) {
       const presetId = agent !== undefined
-        ? resolveSessionPreset(agent.session) ?? presets.defaultId
+        ? composedPresetId(agent) ?? presets.defaultId
         : presets.defaultId
       if (presetId !== undefined) await presets.mount(agentCtx, presetId)
     }
@@ -1915,7 +1937,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   /** Install the per-session model selection and record the running preset (P4b). */
   const adoptRecord = (record: SessionRecord): void => {
     installModelSelection(record.agent.ctx, selectionFor(record))
-    record.preset = resolveSessionPreset(record.agent.session) ?? presetRoster()?.defaultId
+    record.preset = composedPresetId(record.agent) ?? presetRoster()?.defaultId
     // Refine the creation-time route to the resolved selection: for a resumed
     // session this is the persisted request header's provider/model, which
     // `agentOptions()` could not know before the agent existed.
@@ -1945,7 +1967,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
 
   /** Replay a session's full durable log as wire notifications (session/load). */
   const replaySession = (record: SessionRecord): void => {
-    const events = sessionOf(record).events
+    const events = sessionOf(record).snapshotEvents()
     for (const event of events) emitForEvent(record, event, true)
   }
 
@@ -1960,7 +1982,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     const seen = new Set<SessionId>()
     for (const record of sessions.values()) {
       const session = sessionOf(record)
-      const events = session.events
+      const events = session.snapshotEvents()
       seen.add(session.id)
       infos.push({
         sessionId: session.id,
@@ -1986,7 +2008,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
           const preparation = await persistence.prepare(header.id)
           const session = preparation.session
           title = sessionTitle(session) ?? null
-          updatedAt = lastUpdated(session.events)
+          updatedAt = lastUpdated(session.snapshotEvents())
           preparation[Symbol.dispose]()
         } catch (error: unknown) {
           logger.warn(`dshacp: preparing persisted session ${header.id} failed: ${String(error)}`)
@@ -2030,7 +2052,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     }
   }
 
-  const makeAgent = (connection: AgentSideConnection): AcpAgent => {
+  const makeAgent = (connection: AgentSideConnection) => {
     conn = connection
     return {
       initialize(params: InitializeRequest): Promise<InitializeResponse> {
@@ -2044,7 +2066,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         // the latest supported" both resolve to this server's one version.
         return Promise.resolve({
           protocolVersion: PROTOCOL_VERSION,
-          agentInfo: { name: 'dshacp', version: '0.1.0' },
+          agentInfo: { name: 'dshacp', version: '0.2.0' },
           agentCapabilities: {
             loadSession: true,
             // P5: image pasting is accepted (and handled by this bridge, which

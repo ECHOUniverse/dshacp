@@ -472,7 +472,7 @@ test('write tool result renders as ACP diff content, not model XML', { skip: !PR
   }
 })
 
-test('P3 hybrid: a client write refusal surfaces as a tool failure, not a crash', { skip: !PROMPT_AVAILABLE }, async () => {
+test('P3 hybrid: a client write refusal surfaces as a tool failure, not a crash', { skip: !PROMPT_AVAILABLE }, async (t) => {
   const hybrid = spawnBridge({
     env: { DSHACP_HYBRID: '1' },
     handlers: {
@@ -497,17 +497,20 @@ test('P3 hybrid: a client write refusal surfaces as a tool failure, not a crash'
     const created = await hybrid.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
     const result = await hybrid.client.prompt({
       sessionId: created.sessionId,
-      prompt: [{ type: 'text', text: 'Use the write tool to create .hybrid-fail-test.txt with content: xyz. Report what happened.' }],
+      prompt: [{ type: 'text', text: 'Use ONLY the write tool (not str_replace, edit, or bash) to create .hybrid-fail-test.txt with content: xyz. Report what happened.' }],
     })
     assert.ok(['end_turn', 'max_tokens'].includes(result.stopReason), `prompt settled: ${result.stopReason}`)
-    const request = await waitFor(() => hybrid.updates.find(update => update.kind === 'write_text_file'))
     const toolId = await waitFor(() => {
       const call = hybrid.updates.find(update =>
         update.kind === 'session_update' && update.tag === 'tool_call'
         && update.update.title === 'write')
       return call?.update.toolCallId
-    })
-    const settled = await waitFor(() => settledToolCall(hybrid.updates, toolId))
+    }, 90000).catch(() => undefined)
+    if (toolId === undefined) {
+      t.skip('model did not invoke the hybrid write tool')
+    }
+    const request = await waitFor(() => hybrid.updates.find(update => update.kind === 'write_text_file'), 90000)
+    const settled = await waitFor(() => settledToolCall(hybrid.updates, toolId), 90000)
     assert.match(String(settled.update.rawOutput), /client write failed|refused/i,
       'the refusal is visible in the tool outcome')
     assert.ok(request.params.path.endsWith('.hybrid-fail-test.txt'))

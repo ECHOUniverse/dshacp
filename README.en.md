@@ -19,7 +19,7 @@ You (typing questions in Zed)
    Zed editor (agent panel)
         │   ← talks over the ACP protocol
         ▼
-   dsh --profile acp (DSH with the DSHACP plugin)
+   dsh --profile dshacp (DSH with the DSHACP plugin)
         │
         ▼
    DeepSeek (the model that actually answers and writes code)
@@ -35,6 +35,31 @@ backed by DeepSeek.
 - Let it read files, write code, and run commands — every action is visible
 - Before it does anything risky (like editing a file), it asks "allow?"
 - Conversations are saved automatically and can be resumed later
+
+## How is this different from official `dsh --profile acp`?
+
+Since DSH 0.1.2, npm ships both **`@deepseek-ai/dsh-acp`** (`dsh --profile acp`) and this plugin
+**`@hanxu131/dshacp`** (`dsh --profile dshacp`). Both speak ACP v1 over stdio, but they target
+different jobs — **do not install both bridges into the same profile**.
+
+| | Official `@deepseek-ai/dsh-acp` | DSHACP (this plugin) |
+|---|---|---|
+| **Launch** | `dsh --profile acp` | `dsh --profile dshacp` |
+| **Audience** | CI, scripts, automation pipelines | Interactive ACP clients such as [Zed](https://zed.dev) |
+| **Sessions** | Basic `new` / `prompt` / `cancel` | Full lifecycle: `list` / `load` / `resume` / `delete` / `close` |
+| **Streaming** | Mostly turn-level text | **Token-level** `assistant/chunk`, reasoning, tool I/O |
+| **Approval** | Minimal | Pushes `request_permission` to the client (allow once / always) |
+| **Config** | None | Zed panel: **model / thinking / permission / mode** (agent presets) |
+| **Extras** | None | Slash commands, plans, `ask_user_question` (elicitation), HTTP MCP forwarding, optional hybrid file writes |
+| **Install** | Bundled with official profile | `dsh plugin --profile dshacp add @hanxu131/dshacp` |
+
+In short: **official ACP is deliberately narrow for machines; DSHACP is a widened bridge for humans in Zed.**
+
+```
+Zed ──ACP──► dsh --profile dshacp ──► @hanxu131/dshacp (this plugin)
+
+CI  ──ACP──► dsh --profile acp  ──► @deepseek-ai/dsh-acp (official — keep separate)
+```
 
 ---
 
@@ -69,7 +94,7 @@ Download and install it from <https://zed.dev>. This plugin only works with Zed.
 In a terminal, run this one command:
 
 ```sh
-dsh plugin --profile acp add @hanxu131/dshacp
+dsh plugin --profile dshacp add @hanxu131/dshacp
 ```
 
 > First-time installs fetch the latest version (`latest`) directly — no version
@@ -81,14 +106,14 @@ If you already installed it and want to upgrade, **prefer the `update` command**
 (no version number needed):
 
 ```sh
-dsh plugin --profile acp update @hanxu131/dshacp
+dsh plugin --profile dshacp update @hanxu131/dshacp
 ```
 
 For this to work reliably, **permanently disable the release-age gate** in the
 profile's `pnpm-workspace.yaml` by adding one line:
 
 ```sh
-# open ~/.dsh/profiles/acp/pnpm-workspace.yaml, add below the autoInstallPeers line:
+# open ~/.dsh/profiles/dshacp/pnpm-workspace.yaml, add below the autoInstallPeers line:
 minimumReleaseAge: 0
 ```
 
@@ -98,29 +123,44 @@ minimumReleaseAge: 0
 > gate permanently, so `update` always fetches the latest version.
 
 After upgrading, **quit and reopen the DSH session in Zed** (or restart the
-`dsh --profile acp` process) so the new code is actually loaded.
+`dsh --profile dshacp` process) so the new code is actually loaded.
 
 > Alternative: if you'd rather not edit the config, you can pin the version
-> explicitly — `dsh plugin --profile acp add "@hanxu131/dshacp@^0.1.4"`. But
+> explicitly — `dsh plugin --profile dshacp add "@hanxu131/dshacp@^0.2.0"`. But
 > because of pnpm's lock behavior, `update` is the easier day-to-day choice.
+
+### Migrating from the old `acp` profile (0.2.0+)
+
+Since DSH 0.1.2, official `dsh --profile acp` is reserved for `@deepseek-ai/dsh-acp`
+(automation-only ACP). DSHACP uses its own profile **`dshacp`** — do not install both
+bridges into the same profile.
+
+If you previously installed into `~/.dsh/profiles/acp`:
+
+```sh
+dsh plugin --profile acp remove @hanxu131/dshacp
+dsh plugin --profile dshacp add @hanxu131/dshacp
+```
+
+Then change Zed's `"args": ["--profile", "acp"]` to `"dshacp"` and restart the DSH session.
 
 Breaking it down:
 
 - `dsh plugin` = use DSH's plugin manager
-- `--profile acp` = install into a profile named `acp` (created automatically if missing)
+- `--profile dshacp` = install into a profile named `dshacp` (created automatically if missing)
 - `add @hanxu131/dshacp` = install the DSHACP plugin
 
 **How to know it worked**: the command finishes without `error`, ending with
 something like `Done in Xs`.
 
-> To double-check, run `dsh --profile acp --dump-config` — you should see
+> To double-check, run `dsh --profile dshacp --dump-config` — you should see
 > `dshacp`-related config rows in the output.
 
 **Remote SSH is optional** and not included by default. If you want it, add one
 more plugin:
 
 ```sh
-dsh plugin --profile acp add @linxin666/dsh-ssh
+dsh plugin --profile dshacp add @linxin666/dsh-ssh
 ```
 
 ## Step 2: Add DSH to Zed
@@ -135,14 +175,14 @@ dsh plugin --profile acp add @linxin666/dsh-ssh
     "DSH": {
       "type": "custom",
       "command": "dsh",
-      "args": ["--profile", "acp"],
+      "args": ["--profile", "dshacp"],
       "env": {}
     }
   }
 }
 ```
 
-> Here `command` is `dsh` (not `dshacp`): Zed launches `dsh --profile acp`, which
+> Here `command` is `dsh` (not `dshacp`): Zed launches `dsh --profile dshacp`, which
 > boots the profile we just installed. Leave `env` empty.
 
 **How to know it worked**: an option named **DSH** appears in Zed's agent list.
@@ -201,10 +241,10 @@ This is **pnpm's version-locking / release-age gating**, not a mistake in the co
 
 **Recommended fix: disable the gate permanently and use `update`** (see
 "Step 1 → Updating to a newer version"). Add `minimumReleaseAge: 0` to
-`~/.dsh/profiles/acp/pnpm-workspace.yaml`, then the upgrade command is simply:
+`~/.dsh/profiles/dshacp/pnpm-workspace.yaml`, then the upgrade command is simply:
 
 ```sh
-dsh plugin --profile acp update @hanxu131/dshacp
+dsh plugin --profile dshacp update @hanxu131/dshacp
 ```
 
 If you'd rather not edit the config, pin the version explicitly instead (profile
@@ -212,15 +252,15 @@ If you'd rather not edit the config, pin the version explicitly instead (profile
 
 ```sh
 # ✅ Works ad hoc: pin the target range explicitly
-dsh plugin --profile acp add "@hanxu131/dshacp@^0.1.4"
+dsh plugin --profile dshacp add "@hanxu131/dshacp@^0.1.4"
 
 # ❌ Does NOT work: no version, or only @latest — both are blocked by locking/gating
-dsh plugin --profile acp add @hanxu131/dshacp
-dsh plugin --profile acp add "@hanxu131/dshacp@latest"
+dsh plugin --profile dshacp add @hanxu131/dshacp
+dsh plugin --profile dshacp add "@hanxu131/dshacp@latest"
 ```
 
 After upgrading, **restart the DSH session in Zed** (or restart the
-`dsh --profile acp` process) so the new code takes effect.
+`dsh --profile dshacp` process) so the new code takes effect.
 
 ---
 
@@ -247,7 +287,7 @@ example below is illustrative — use whatever the panel actually shows):
 "DSH": {
   "type": "custom",
   "command": "dsh",
-  "args": ["--profile", "acp"],
+      "args": ["--profile", "dshacp"],
   "env": {},
   "default_config_options": {
     "model": "deepseek-official:deepseek-v4-pro",
@@ -289,7 +329,7 @@ npm run build   # compile TypeScript
 npm test        # run tests
 ```
 
-### Link a local build into the DSH acp profile (for developers)
+### Link a local build into the DSH dshacp profile (for developers)
 
 **Do not `npm link` the source tree** — it pulls the repo's `node_modules/` into the
 profile, which duplicates Cordis plugins (`deployment:persona already registered`)
@@ -298,7 +338,7 @@ or breaks imports (`schemastery not found`).
 From the repo root:
 
 ```sh
-./scripts/dev-link-dsh-profile.sh   # build → npm pack → install into ~/.dsh/profiles/acp
+./scripts/dev-link-dsh-profile.sh   # build → npm pack → install into ~/.dsh/profiles/dshacp
 ```
 
 After code changes, re-run that script and **restart your Zed DSH session**. To restore
@@ -313,7 +353,7 @@ the registry release:
 - **Paste a screenshot for DeepSeek to read**: after installing `uv`/`uvx` and the
   qwenmm plugin, you can paste screenshots into Zed for the model to "see". See
   `docs/P5-image-paste-qwenmm.md`.
-- **Remote SSH**: `dsh plugin --profile acp add @linxin666/dsh-ssh`.
+- **Remote SSH**: `dsh plugin --profile dshacp add @linxin666/dsh-ssh`.
 - **Hybrid mode**: `DSHACP_HYBRID=1` — file edits appear as reviewable diffs.
 
 ### ACP surface (protocol layer, for developers)

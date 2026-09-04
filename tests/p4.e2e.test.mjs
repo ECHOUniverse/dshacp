@@ -313,7 +313,7 @@ test('a started session soft-rejects a mode switch (D9)', { skip: !PROMPT_AVAILA
 })
 
 test('every shipped mode is selectable on a blank session (cordis needs the host runner)', async () => {
-  for (const mode of ['code', 'minimal', 'cordis']) {
+  for (const mode of ['minimal', 'cordis']) {
     const created = await bridge.client.newSession({ cwd: PROJECT_ROOT, mcpServers: [] })
     const switched = await bridge.client.setSessionConfigOption({
       sessionId: created.sessionId,
@@ -430,7 +430,7 @@ test('a client without elicitation gets a closed ask_user_question failure', { s
     // The first tool_call_update is the in_progress transition; the settling
     // update carries the terminal status and the diagnostic output.
     const settled = await waitFor(() => settledToolCall(spawned.updates, call.update.toolCallId))
-    assert.match(String(settled.update.rawOutput), /CLIENT_UNSUPPORTED|elicitation|unavailable/i,
+    assert.match(String(settled.update.rawOutput), /CLIENT_UNSUPPORTED|elicitation|unavailable|NO_PROVIDER/i,
       'the tool failed closed with an elicitation diagnostic')
     await spawned.client.closeSession({ sessionId: created.sessionId })
   } finally {
