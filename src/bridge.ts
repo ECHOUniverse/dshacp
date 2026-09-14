@@ -101,6 +101,7 @@ import {
   turnEndToStopReason,
 } from './codec.ts'
 import { mapUserQuestionsToElicitation } from './elicitation-map.ts'
+import { resolveRecordedPreset } from './preset.ts'
 
 export const name = 'dshacp-bridge'
 /** The bridge creates and owns agents; the title service and store serve the wire. */
@@ -362,9 +363,14 @@ interface SessionRecord {
  * @param config - Provider/model selection, approval timeout, and optional test transport.
  */
 export function apply(ctx: Context, config: BridgeConfig): void {
+  // Shadow `agent` on the bridge's accessing context so agent-loop's
+  // `ownerCtx.agent` reads `undefined` at the top-level runtime root (older
+  // DSH builds lack AgentRegistry's `ctx.accessor('agent')`). Own properties
+  // resolve before the Cordis proxy, so this never pollutes the isolate store.
+  const ownerCtx = ctx.extend({ agent: undefined })
   // ACP handlers execute outside this plugin's injection scope, so capture the
   // injected services during apply rather than reading them lazily in a callback.
-  const agents = ctx.agents
+  const agents = ownerCtx.agents
   const logger = ctx.logger
   const sessions = new Map<SessionId, SessionRecord>()
   const approvalTimeoutMs = config.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS
@@ -1804,11 +1810,11 @@ export function apply(ctx: Context, config: BridgeConfig): void {
    * stays DSH-owned. Relative paths resolve against the session cwd (the ACP
    * wire requires absolute paths).
    *
-   * The preset id resolves from the session itself: the creation header names
-   * it for fresh sessions (`agentPreset` in `meta`), and a loaded log's last
-   * `agent-preset/selected` event wins for resume (DESIGN D14).
+   * The preset id is resolved before create/resume and closed over here:
+   * setup runs while the agent is still unpublished, so it must never read
+   * `agentCtx.agent` (Cordis throws `cannot get property "agent" without inject`).
    */
-  const composeSetup = (sessionId: SessionId, cwd: string): AgentSetup => async (agentCtx) => {
+  const composeSetup = (sessionId: SessionId, cwd: string, presetId: string | undefined): AgentSetup => async (agentCtx) => {
     if (config.hybridFileWrites === true && clientFsWrite) {
       agentCtx.tools.register(defineTool({
         name: 'write',
@@ -1873,16 +1879,13 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         },
       }))
     }
-    // Compose the agent from the preset the session runs. The roster mount is
-    // the one supported call site: while the agent is still unpublished, a
-    // rejected composition rolls the whole creation back.
+    // Compose the agent from the preset resolved before create/resume. The
+    // roster mount is the one supported call site: while the agent is still
+    // unpublished, a rejected composition rolls the whole creation back.
     const presets = presetRoster()
-    const agent = agentCtx.agent
     if (presets !== undefined) {
-      const presetId = agent !== undefined
-        ? composedPresetId(agent) ?? presets.defaultId
-        : presets.defaultId
-      if (presetId !== undefined) await presets.mount(agentCtx, presetId)
+      const mountId = presetId ?? presets.defaultId
+      if (mountId !== undefined) await presets.mount(agentCtx, mountId)
     }
   }
 
@@ -1948,12 +1951,32 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   const resumeRecord = async (sessionId: SessionId, cwd: string): Promise<SessionRecord> => {
     assertOpen()
     if (sessions.has(sessionId)) throw invalidParams(`session is already open: ${sessionId}`)
+    const presets = presetRoster()
+    let presetId: string | undefined
+    if (presets !== undefined) {
+      const persistence = ctx.get('sessionPersistence')
+      if (persistence !== undefined) {
+        try {
+          const preparation = await persistence.prepare(sessionId)
+          try {
+            presetId = resolveRecordedPreset(preparation.session)
+          } finally {
+            preparation[Symbol.dispose]()
+          }
+        } catch (error: unknown) {
+          logger.warn(`dshacp: preparing persisted session ${sessionId} for preset resolution failed: ${String(error)}`)
+          presetId = presets.defaultId
+        }
+      } else {
+        presetId = presets.defaultId
+      }
+    }
     const handle = await agents.resume({
       resumeSessionId: sessionId,
       // Always explicit: children inherit the parent's provider/model from
       // AgentOptions, so the pair must never be left absent (subagent fix).
       agentOptions: agentOptions(),
-      setup: composeSetup(sessionId, cwd),
+      setup: composeSetup(sessionId, cwd, presetId),
     })
     if (closed) {
       await handle.dispose()
@@ -2109,7 +2132,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
           // Always explicit: children inherit the parent's provider/model from
           // AgentOptions, so the pair must never be left absent (subagent fix).
           agentOptions: agentOptions(),
-          setup: composeSetup(sessionId, params.cwd),
+          setup: composeSetup(sessionId, params.cwd, presetId),
         })
         /* v8 ignore next 4 -- a real stdio close can race an in-flight create. */
         if (closed) {

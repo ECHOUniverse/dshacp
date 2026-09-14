@@ -76,7 +76,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test 'tests/*.test.mjs'",
-    "test:unit": "node --test 'tests/codec*.test.mjs' 'tests/settle-config.test.mjs' 'tests/bridge.usage.test.mjs' 'tests/elicitation-map.test.mjs'",
+    "test:unit": "node --test 'tests/codec*.test.mjs' 'tests/settle-config.test.mjs' 'tests/bridge.usage.test.mjs' 'tests/elicitation-map.test.mjs' 'tests/preset.test.mjs'",
     "test:e2e": "node --test 'tests/*.e2e.test.mjs'",
     "prepublishOnly": "npm run build && npm run test:unit",
     "release": "bash scripts/release.sh"
